@@ -1,3 +1,3 @@
-module github.com/big-pixel-media/theater
+module github.com/ironfang-ltd/go-theatre
 
 go 1.22.1
