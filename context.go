@@ -1,4 +1,4 @@
-package theater
+package theatre
 
 type Context struct {
 	// The ID of the current actor

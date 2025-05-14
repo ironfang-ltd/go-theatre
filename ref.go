@@ -1,4 +1,4 @@
-package theater
+package theatre
 
 type Ref struct {
 	Type string

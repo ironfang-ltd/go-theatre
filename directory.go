@@ -1,4 +1,4 @@
-package theater
+package theatre
 
 import "sync"
 

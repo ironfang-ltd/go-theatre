@@ -1,4 +1,4 @@
-package theater
+package theatre
 
 type Inbox struct {
 	rb *RingBuffer[InboxMessage]

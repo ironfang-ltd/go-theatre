@@ -1,4 +1,4 @@
-package theater
+package theatre
 
 type InboxMessage struct {
 	SenderHostRef HostRef
