@@ -10,24 +10,21 @@ type Context struct {
 	// The message being processed
 	Message interface{}
 
+	host    *Host
 	replyId int64
-	outbox  chan OutboxMessage
 }
 
 func (c *Context) Send(ref Ref, body interface{}) error {
-	c.outbox <- OutboxMessage{
-		RecipientRef: ref,
-		IsReply:      false,
-		ReplyID:      0,
-		Body:         body,
-	}
+	return c.host.Send(ref, body)
+}
 
-	return nil
+func (c *Context) Request(ref Ref, body interface{}) (any, error) {
+	return c.host.Request(ref, body)
 }
 
 func (c *Context) Reply(body interface{}) error {
 
-	c.outbox <- OutboxMessage{
+	c.host.outbox <- OutboxMessage{
 		RecipientHostRef: c.SenderHostRef,
 		RecipientRef:     Ref{},
 		IsReply:          true,

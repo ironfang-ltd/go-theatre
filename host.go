@@ -82,11 +82,13 @@ func (m *Host) RegisterActor(name string, creator Creator) {
 	}
 }
 
-func (m *Host) Send(ref Ref, body interface{}) {
+func (m *Host) Send(ref Ref, body interface{}) error {
 	m.outbox <- OutboxMessage{
 		RecipientRef: ref,
 		Body:         body,
 	}
+
+	return nil
 }
 
 func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
@@ -187,7 +189,7 @@ func (m *Host) createLocalActor(ref Ref) *Actor {
 
 	receiver := d.Create()
 
-	a := NewActor(ref, receiver, m.outbox)
+	a := NewActor(m, ref, receiver)
 	go a.Receive()
 
 	m.actors.Register(a)

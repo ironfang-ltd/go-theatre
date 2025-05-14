@@ -11,16 +11,41 @@ type TestActor struct {
 	wg *sync.WaitGroup
 }
 
+type TestActor2 struct {
+}
+
 func (a *TestActor) Receive(ctx *Context) error {
 
-	switch ctx.Message.(type) {
+	switch msg := ctx.Message.(type) {
 	case *TestPing:
-		ctx.Reply(&TestPong{})
+		return ctx.Reply(&TestPong{})
 	case *TestMessage:
 		a.wg.Done()
 	case *TestRequestMsg:
-		ctx.Reply(&TestResponseMsg{
-			Sequence: ctx.Message.(*TestRequestMsg).Sequence,
+		return ctx.Reply(&TestResponseMsg{
+			Sequence: msg.Sequence,
+		})
+	case *TestActorToActorRequestMsg:
+
+		ref := NewRef("test-2", "2")
+
+		res, err := ctx.Request(ref, &TestActorToActorRequestMsg{Sequence: msg.Sequence + 1})
+		if err != nil {
+			return err
+		}
+
+		return ctx.Reply(res)
+	}
+
+	return nil
+}
+
+func (a *TestActor2) Receive(ctx *Context) error {
+
+	switch msg := ctx.Message.(type) {
+	case *TestActorToActorRequestMsg:
+		return ctx.Reply(&TestResponseMsg{
+			Sequence: msg.Sequence + 1,
 		})
 	}
 
@@ -34,6 +59,10 @@ type TestPing struct{}
 type TestPong struct{}
 
 type TestRequestMsg struct {
+	Sequence int
+}
+
+type TestActorToActorRequestMsg struct {
 	Sequence int
 }
 
@@ -57,7 +86,10 @@ func TestSend(t *testing.T) {
 
 	ref := NewRef("test", "1")
 
-	host.Send(ref, &TestMessage{})
+	err := host.Send(ref, &TestMessage{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	wg.Wait()
 }
@@ -79,7 +111,10 @@ func TestSendMultiple(t *testing.T) {
 	ref := NewRef("test", "1")
 
 	for i := 0; i < 10; i++ {
-		host.Send(ref, &TestMessage{})
+		err := host.Send(ref, &TestMessage{})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	wg.Wait()
@@ -112,6 +147,37 @@ func TestRequest(t *testing.T) {
 	}
 }
 
+func TestActorToActor(t *testing.T) {
+
+	host := NewHost()
+
+	host.RegisterActor("test", func() Receiver {
+		return &TestActor{wg: &sync.WaitGroup{}}
+	})
+
+	host.RegisterActor("test-2", func() Receiver {
+		return &TestActor2{}
+	})
+
+	host.Start()
+	defer host.Stop()
+
+	ref := NewRef("test", "1")
+
+	res, err := host.Request(ref, &TestActorToActorRequestMsg{Sequence: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if res == nil {
+		t.Fatal("response is nil")
+	}
+
+	if res.(*TestResponseMsg).Sequence != 3 {
+		t.Fatalf("response sequence is not %d, expected 3", res.(*TestResponseMsg).Sequence)
+	}
+}
+
 func TestStop(t *testing.T) {
 
 	wg := &sync.WaitGroup{}
@@ -127,7 +193,10 @@ func TestStop(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		ref := NewRef("test", strconv.Itoa(i))
-		host.Send(ref, &TestMessage{})
+		err := host.Send(ref, &TestMessage{})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	wg.Wait()

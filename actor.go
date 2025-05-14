@@ -19,21 +19,21 @@ const (
 )
 
 type Actor struct {
+	host        *Host
 	ref         Ref
 	receiver    Receiver
 	inbox       chan InboxMessage
-	outbox      chan OutboxMessage
 	shutdown    chan bool
 	lastMessage int64
 	status      int64
 }
 
-func NewActor(ref Ref, receiver Receiver, outbox chan OutboxMessage) *Actor {
+func NewActor(host *Host, ref Ref, receiver Receiver) *Actor {
 	return &Actor{
+		host:     host,
 		ref:      ref,
 		receiver: receiver,
 		inbox:    make(chan InboxMessage),
-		outbox:   outbox,
 		shutdown: make(chan bool),
 	}
 }
@@ -69,7 +69,7 @@ func (a *Actor) Receive() {
 
 	ctx := Context{
 		ActorRef: a.ref,
-		outbox:   a.outbox,
+		host:     a.host,
 	}
 
 	for msg := range a.inbox {
@@ -124,7 +124,7 @@ func (a *Actor) replyWithError(msg InboxMessage, err error) {
 
 	// if there is a reply ID, send an error response
 	if msg.ReplyID != 0 {
-		a.outbox <- OutboxMessage{
+		a.host.outbox <- OutboxMessage{
 			RecipientHostRef: msg.SenderHostRef,
 			RecipientRef:     msg.RecipientRef,
 			IsReply:          true,
