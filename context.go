@@ -2,7 +2,7 @@ package theatre
 
 type Context struct {
 	// The ID of the current actor
-	ActorRef Ref
+	ActorRef ActorRef
 
 	// The sender host reference
 	SenderHostRef HostRef
@@ -14,11 +14,11 @@ type Context struct {
 	replyId int64
 }
 
-func (c *Context) Send(ref Ref, body interface{}) error {
+func (c *Context) Send(ref ActorRef, body interface{}) error {
 	return c.host.Send(ref, body)
 }
 
-func (c *Context) Request(ref Ref, body interface{}) (any, error) {
+func (c *Context) Request(ref ActorRef, body interface{}) (any, error) {
 	return c.host.Request(ref, body)
 }
 
@@ -26,7 +26,7 @@ func (c *Context) Reply(body interface{}) error {
 
 	c.host.outbox <- OutboxMessage{
 		RecipientHostRef: c.SenderHostRef,
-		RecipientRef:     Ref{},
+		RecipientRef:     ActorRef{},
 		IsReply:          true,
 		ReplyID:          c.replyId,
 		Body:             body,

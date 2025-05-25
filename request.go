@@ -13,7 +13,7 @@ var (
 
 type Request struct {
 	ID       int64
-	To       Ref
+	To       ActorRef
 	Response chan *Response
 	SentAt   time.Time
 }
@@ -42,7 +42,7 @@ func NewRequestManager() *RequestManager {
 	}
 }
 
-func (rm *RequestManager) Create(ref Ref) *Request {
+func (rm *RequestManager) Create(ref ActorRef) *Request {
 
 	reqID := atomic.AddInt64(&rm.reqID, 1)
 

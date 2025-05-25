@@ -26,12 +26,12 @@ func (r HostRef) String() string {
 
 func createNewHostRef() (HostRef, error) {
 
-	addrs, err := net.InterfaceAddrs()
+	addresses, err := net.InterfaceAddrs()
 	if err != nil {
 		return HostRef{}, err
 	}
 
-	for _, addr := range addrs {
+	for _, addr := range addresses {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
 				epoch := int(time.Now().Unix())

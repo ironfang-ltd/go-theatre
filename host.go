@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+type HostMode string
+
+const (
+	HostModeLocal   HostMode = "local"
+	HostModeCluster HostMode = "cluster"
+)
+
 type Creator func() Receiver
 
 type Descriptor struct {
@@ -20,6 +27,7 @@ type Response struct {
 
 type Host struct {
 	hostRef     HostRef
+	hostOpts    *HostOptions
 	descriptors map[string]*Descriptor
 	actors      *ActorRegistry
 	requests    *RequestManager
@@ -31,19 +39,33 @@ type Host struct {
 	inbox   chan InboxMessage
 }
 
-func NewHost() *Host {
+func NewHost(opts ...HostOption) *Host {
+
+	hostOpts := &HostOptions{
+		Mode: HostModeLocal,
+	}
+
+	for _, opt := range opts {
+		opt(hostOpts)
+	}
 
 	hostRef, err := createNewHostRef()
 	if err != nil {
 		panic(err)
 	}
 
+	d := NewDirectory(hostRef)
+	if hostOpts.Mode == HostModeCluster {
+		d = NewClusterDirectory(hostRef)
+	}
+
 	return &Host{
 		hostRef:     hostRef,
+		hostOpts:    hostOpts,
 		mu:          sync.RWMutex{},
 		descriptors: make(map[string]*Descriptor),
 		requests:    NewRequestManager(),
-		directory:   NewDirectory(),
+		directory:   d,
 		actors:      NewActorManager(),
 		resPool: sync.Pool{
 			New: func() interface{} {
@@ -57,7 +79,7 @@ func NewHost() *Host {
 
 func (m *Host) Start() {
 
-	slog.Info("starting", "host", m.hostRef.String())
+	slog.Info("starting", "host", m.hostRef.String(), "mode", m.hostOpts.Mode)
 
 	go m.cleanup()
 	go m.processOutbox()
@@ -82,7 +104,7 @@ func (m *Host) RegisterActor(name string, creator Creator) {
 	}
 }
 
-func (m *Host) Send(ref Ref, body interface{}) error {
+func (m *Host) Send(ref ActorRef, body interface{}) error {
 	m.outbox <- OutboxMessage{
 		RecipientRef: ref,
 		Body:         body,
@@ -91,7 +113,7 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 	return nil
 }
 
-func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
+func (m *Host) Request(ref ActorRef, body interface{}) (interface{}, error) {
 
 	// create a new request to track the response
 	req := m.requests.Create(ref)
@@ -156,14 +178,16 @@ func (m *Host) processOutbox() {
 	for msg := range m.outbox {
 
 		// check the directory to see if the actor is registered
-		/*hostRef, ok := m.directory.Lookup(msg.To)
-		if ok {
-			if hostRef != m.hostRef {
-				// forward the message to the remote host
-				slog.Info("forwarding message to remote host", "type", msg.To.Type, "id", msg.To.ID, "host", hostRef.String())
-				continue
-			}
-		}*/
+		hostRef, err := m.directory.Lookup(msg.RecipientRef)
+		if err != nil {
+			slog.Error("directory lookup failed", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID, "err", err)
+		}
+
+		if hostRef != m.hostRef {
+			// forward the message to the remote host
+			slog.Info("forwarding message to remote host", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID, "host", hostRef.String())
+			continue
+		}
 
 		// route all messages to the local actor manager
 		m.inbox <- InboxMessage{
@@ -177,7 +201,7 @@ func (m *Host) processOutbox() {
 	}
 }
 
-func (m *Host) createLocalActor(ref Ref) *Actor {
+func (m *Host) createLocalActor(ref ActorRef) *Actor {
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()

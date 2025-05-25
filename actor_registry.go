@@ -7,13 +7,13 @@ import (
 )
 
 type ActorRegistry struct {
-	actors map[Ref]*Actor
+	actors map[ActorRef]*Actor
 	mu     sync.RWMutex
 }
 
 func NewActorManager() *ActorRegistry {
 	return &ActorRegistry{
-		actors: make(map[Ref]*Actor),
+		actors: make(map[ActorRef]*Actor),
 	}
 }
 
@@ -24,14 +24,14 @@ func (am *ActorRegistry) Register(a *Actor) {
 	am.actors[a.ref] = a
 }
 
-func (am *ActorRegistry) Lookup(ref Ref) *Actor {
+func (am *ActorRegistry) Lookup(ref ActorRef) *Actor {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
 
 	return am.actors[ref]
 }
 
-func (am *ActorRegistry) Remove(ref Ref) {
+func (am *ActorRegistry) Remove(ref ActorRef) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 

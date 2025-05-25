@@ -20,7 +20,7 @@ const (
 
 type Actor struct {
 	host        *Host
-	ref         Ref
+	ref         ActorRef
 	receiver    Receiver
 	inbox       chan InboxMessage
 	shutdown    chan bool
@@ -28,7 +28,7 @@ type Actor struct {
 	status      int64
 }
 
-func NewActor(host *Host, ref Ref, receiver Receiver) *Actor {
+func NewActor(host *Host, ref ActorRef, receiver Receiver) *Actor {
 	return &Actor{
 		host:     host,
 		ref:      ref,

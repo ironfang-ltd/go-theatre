@@ -2,7 +2,7 @@ package theatre
 
 type InboxMessage struct {
 	SenderHostRef HostRef
-	RecipientRef  Ref
+	RecipientRef  ActorRef
 	IsReply       bool
 	ReplyID       int64
 	Body          interface{}
@@ -11,7 +11,7 @@ type InboxMessage struct {
 
 type OutboxMessage struct {
 	RecipientHostRef HostRef
-	RecipientRef     Ref
+	RecipientRef     ActorRef
 	IsReply          bool
 	ReplyID          int64
 	Body             interface{}

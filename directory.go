@@ -1,42 +1,27 @@
 package theatre
 
-import "sync"
-
 type Directory interface {
-	Register(ref Ref, hostRef HostRef)
-	Lookup(ref Ref) (HostRef, bool)
-	Unregister(ref Ref)
+	Register(ref ActorRef, hostRef HostRef)
+	Lookup(ref ActorRef) (HostRef, error)
+	Unregister(ref ActorRef)
 }
 
 type directory struct {
-	actors map[Ref]HostRef
-	mu     sync.Mutex
+	hostRef HostRef
 }
 
-func NewDirectory() Directory {
+func NewDirectory(hostRef HostRef) Directory {
 	return &directory{
-		actors: make(map[Ref]HostRef),
+		hostRef: hostRef,
 	}
 }
 
-func (d *directory) Register(ref Ref, hostRef HostRef) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.actors[ref] = hostRef
+func (d *directory) Register(_ ActorRef, _ HostRef) {
 }
 
-func (d *directory) Lookup(ref Ref) (HostRef, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	hostRef, ok := d.actors[ref]
-	return hostRef, ok
+func (d *directory) Lookup(_ ActorRef) (HostRef, error) {
+	return d.hostRef, nil
 }
 
-func (d *directory) Unregister(ref Ref) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	delete(d.actors, ref)
+func (d *directory) Unregister(_ ActorRef) {
 }
