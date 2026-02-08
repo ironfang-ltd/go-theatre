@@ -48,6 +48,11 @@ func (rm *RequestManager) Create(ref Ref) *Request {
 
 	r := rm.reqPool.Get().(*Request)
 
+	// drain any stale responses from a previous use
+	for len(r.Response) > 0 {
+		<-r.Response
+	}
+
 	r.ID = reqID
 	r.To = ref
 	r.SentAt = time.Now()
@@ -90,7 +95,6 @@ func (rm *RequestManager) RemoveExpired() {
 		if time.Since(req.SentAt) > 5*time.Second {
 			delete(rm.requests, req.ID)
 			req.Timeout()
-			rm.reqPool.Put(req)
 		}
 	}
 }

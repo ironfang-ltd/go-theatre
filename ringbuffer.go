@@ -3,7 +3,6 @@ package theatre
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 )
 
 var (
@@ -31,22 +30,24 @@ func NewRingBuffer[T any](size int64) *RingBuffer[T] {
 }
 
 func (r *RingBuffer[T]) Len() int64 {
-	return atomic.LoadInt64(&r.len)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.len
 }
 
 func (r *RingBuffer[T]) Write(val T) error {
 
-	if r.Len() == r.size {
-		return ErrRingBufferFull
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.len == r.size {
+		return ErrRingBufferFull
+	}
 
 	r.buf[r.writeIdx] = val
 	r.writeIdx = (r.writeIdx + 1) % r.size
 
-	atomic.AddInt64(&r.len, 1)
+	r.len++
 
 	return nil
 }
@@ -55,32 +56,32 @@ func (r *RingBuffer[T]) Read() (T, bool) {
 
 	var v T
 
-	if r.Len() == 0 {
-		return v, false
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.len == 0 {
+		return v, false
+	}
 
 	v = r.buf[r.readIdx]
 	r.readIdx = (r.readIdx + 1) % r.size
 
-	atomic.AddInt64(&r.len, -1)
+	r.len--
 
 	return v, true
 }
 
 func (r *RingBuffer[T]) ReadN(n int64) ([]T, bool) {
 
-	if r.Len() == 0 {
-		return nil, false
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if n > r.Len() {
-		n = r.Len()
+	if r.len == 0 {
+		return nil, false
+	}
+
+	if n > r.len {
+		n = r.len
 	}
 
 	var vals []T
@@ -91,7 +92,7 @@ func (r *RingBuffer[T]) ReadN(n int64) ([]T, bool) {
 
 	r.readIdx = (r.readIdx + n) % r.size
 
-	atomic.AddInt64(&r.len, -n)
+	r.len -= n
 
 	return vals, true
 }

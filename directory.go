@@ -10,7 +10,7 @@ type Directory interface {
 
 type directory struct {
 	actors map[Ref]HostRef
-	mu     sync.Mutex
+	mu     sync.RWMutex
 }
 
 func NewDirectory() Directory {
@@ -27,8 +27,8 @@ func (d *directory) Register(ref Ref, hostRef HostRef) {
 }
 
 func (d *directory) Lookup(ref Ref) (HostRef, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
 	hostRef, ok := d.actors[ref]
 	return hostRef, ok

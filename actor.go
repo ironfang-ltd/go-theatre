@@ -1,6 +1,7 @@
 package theatre
 
 import (
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync/atomic"
@@ -85,7 +86,6 @@ func (a *Actor) Receive() {
 		if err != nil {
 			slog.Error("actor receive error", "type", a.ref.Type, "id", a.ref.ID, "error", err)
 			a.replyWithError(msg, err)
-			continue
 		}
 
 		if _, ok := msg.Body.(Shutdown); ok {
@@ -113,7 +113,11 @@ func (a *Actor) receive(ctx *Context) (err error) {
 	defer (func() {
 		if r := recover(); r != nil {
 			debug.PrintStack()
-			err = r.(error)
+			if e, ok := r.(error); ok {
+				err = e
+			} else {
+				err = fmt.Errorf("panic: %v", r)
+			}
 		}
 	})()
 

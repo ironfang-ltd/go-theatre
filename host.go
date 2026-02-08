@@ -29,6 +29,7 @@ type Host struct {
 	resPool sync.Pool
 	outbox  chan OutboxMessage
 	inbox   chan InboxMessage
+	done    chan struct{}
 }
 
 func NewHost() *Host {
@@ -52,6 +53,7 @@ func NewHost() *Host {
 		},
 		outbox: make(chan OutboxMessage, 512),
 		inbox:  make(chan InboxMessage, 512),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -68,6 +70,7 @@ func (m *Host) Stop() {
 
 	slog.Info("stopping", "host", m.hostRef.String())
 
+	close(m.done)
 	m.actors.RemoveAll()
 }
 
@@ -118,33 +121,38 @@ func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
 }
 
 func (m *Host) processInbox() {
-	for msg := range m.inbox {
+	for {
+		select {
+		case <-m.done:
+			return
+		case msg := <-m.inbox:
 
-		if msg.IsReply {
+			if msg.IsReply {
 
-			req := m.requests.Get(msg.ReplyID)
-			if req != nil {
-				res := m.resPool.Get().(*Response)
-				res.Body = msg.Body
-				res.Error = msg.Error
-				req.Response <- res
-			}
-			continue
-		}
-
-		// try to find the actor in the local registry
-		a := m.actors.Lookup(msg.RecipientRef)
-		if a == nil {
-
-			// if the actor is not found, create it
-			a = m.createLocalActor(msg.RecipientRef)
-			if a == nil {
-				slog.Error("failed to create actor", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
+				req := m.requests.Get(msg.ReplyID)
+				if req != nil {
+					res := m.resPool.Get().(*Response)
+					res.Body = msg.Body
+					res.Error = msg.Error
+					req.Response <- res
+				}
 				continue
 			}
-		}
 
-		a.Send(msg)
+			// try to find the actor in the local registry
+			a := m.actors.Lookup(msg.RecipientRef)
+			if a == nil {
+
+				// if the actor is not found, create it
+				a = m.createLocalActor(msg.RecipientRef)
+				if a == nil {
+					slog.Error("failed to create actor", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
+					continue
+				}
+			}
+
+			a.Send(msg)
+		}
 	}
 }
 
@@ -153,26 +161,31 @@ func (m *Host) processOutbox() {
 	// process messages in the outbox queue
 	// and forward them to the appropriate actor
 
-	for msg := range m.outbox {
+	for {
+		select {
+		case <-m.done:
+			return
+		case msg := <-m.outbox:
 
-		// check the directory to see if the actor is registered
-		/*hostRef, ok := m.directory.Lookup(msg.To)
-		if ok {
-			if hostRef != m.hostRef {
-				// forward the message to the remote host
-				slog.Info("forwarding message to remote host", "type", msg.To.Type, "id", msg.To.ID, "host", hostRef.String())
-				continue
+			// check the directory to see if the actor is registered
+			/*hostRef, ok := m.directory.Lookup(msg.To)
+			if ok {
+				if hostRef != m.hostRef {
+					// forward the message to the remote host
+					slog.Info("forwarding message to remote host", "type", msg.To.Type, "id", msg.To.ID, "host", hostRef.String())
+					continue
+				}
+			}*/
+
+			// route all messages to the local actor manager
+			m.inbox <- InboxMessage{
+				SenderHostRef: m.hostRef,
+				RecipientRef:  msg.RecipientRef,
+				Body:          msg.Body,
+				ReplyID:       msg.ReplyID,
+				IsReply:       msg.IsReply,
+				Error:         msg.Error,
 			}
-		}*/
-
-		// route all messages to the local actor manager
-		m.inbox <- InboxMessage{
-			SenderHostRef: m.hostRef,
-			RecipientRef:  msg.RecipientRef,
-			Body:          msg.Body,
-			ReplyID:       msg.ReplyID,
-			IsReply:       msg.IsReply,
-			Error:         msg.Error,
 		}
 	}
 }
@@ -192,6 +205,12 @@ func (m *Host) createLocalActor(ref Ref) *Actor {
 	a := NewActor(m, ref, receiver)
 	go a.Receive()
 
+	a.inbox <- InboxMessage{
+		SenderHostRef: m.hostRef,
+		RecipientRef:  ref,
+		Body:          Initialize{},
+	}
+
 	m.actors.Register(a)
 
 	return a
@@ -199,10 +218,16 @@ func (m *Host) createLocalActor(ref Ref) *Actor {
 
 func (m *Host) cleanup() {
 
-	timer := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-	for range timer.C {
-		m.actors.RemoveIdle()
-		m.requests.RemoveExpired()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			m.actors.RemoveIdle()
+			m.requests.RemoveExpired()
+		}
 	}
 }
