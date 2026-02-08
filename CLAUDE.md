@@ -20,7 +20,7 @@ go test -bench BenchmarkHost_Request ./...  # Run benchmarks
 
 **Host** — The runtime container. Manages actor lifecycles, routes messages via inbox/outbox channels, tracks request/response pairs, and runs periodic cleanup (idle actors removed after 15s, expired requests after 5s).
 
-**Actor** — Each actor runs in its own goroutine, processing messages sequentially from an inbox channel. Actors are created lazily on first message and auto-shutdown after 15 seconds of inactivity.
+**Actor** — Each actor runs in its own goroutine, processing messages sequentially from an inbox channel. Actors are created lazily on first message and auto-shutdown after 15 seconds of inactivity. Every actor receives an `Initialize` message before any other message, allowing setup work (loading state, opening connections) in the `Receive` handler. A `Shutdown` message is sent when the actor is being stopped.
 
 **Receiver** — The primary extension interface. Implement `Receive(ctx *Context) error` to define actor behavior.
 
@@ -31,7 +31,7 @@ go test -bench BenchmarkHost_Request ./...  # Run benchmarks
 ### Message Flow
 
 ```
-Host.Send/Request → outbox channel → Host processes → finds/creates Actor → Actor inbox → Receiver.Receive(ctx) → ctx.Send/Request/Reply → outbox
+Host.Send/Request → outbox channel → Host processes → finds/creates Actor → Initialize → Actor inbox → Receiver.Receive(ctx) → ctx.Send/Request/Reply → outbox
 ```
 
 Two messaging patterns: fire-and-forget (`Send`) and request/response (`Request` with timeout).
