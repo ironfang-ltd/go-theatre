@@ -45,12 +45,19 @@ func (am *ActorRegistry) Remove(ref Ref) {
 	a.Shutdown()
 }
 
-func (am *ActorRegistry) RemoveIdle() {
+func (am *ActorRegistry) DeregisterOnly(ref Ref) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	delete(am.actors, ref)
+}
+
+func (am *ActorRegistry) RemoveIdle(idleTimeout time.Duration) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 
 	for ref, a := range am.actors {
-		if time.Since(a.GetLastMessageTime()) > 15*time.Second {
+		if time.Since(a.GetLastMessageTime()) > idleTimeout {
 			slog.Info("actor idle, shutting down", "type", ref.Type, "id", ref.ID)
 			delete(am.actors, ref)
 			a.Shutdown()

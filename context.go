@@ -15,23 +15,27 @@ type Context struct {
 }
 
 func (c *Context) Send(ref Ref, body interface{}) error {
-	return c.host.Send(ref, body)
+	c.host.sendInternal(OutboxMessage{
+		RecipientRef: ref,
+		Body:         body,
+	})
+	return nil
 }
 
 func (c *Context) Request(ref Ref, body interface{}) (any, error) {
-	return c.host.Request(ref, body)
+	return c.host.requestInternal(ref, body)
 }
 
 func (c *Context) Reply(body interface{}) error {
 
-	c.host.outbox <- OutboxMessage{
+	c.host.sendInternal(OutboxMessage{
 		RecipientHostRef: c.SenderHostRef,
 		RecipientRef:     Ref{},
 		IsReply:          true,
 		ReplyID:          c.replyId,
 		Body:             body,
 		Error:            nil,
-	}
+	})
 
 	return nil
 }

@@ -87,12 +87,12 @@ func (rm *RequestManager) Remove(id int64) {
 	rm.reqPool.Put(req)
 }
 
-func (rm *RequestManager) RemoveExpired() {
+func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	for _, req := range rm.requests {
-		if time.Since(req.SentAt) > 5*time.Second {
+		if time.Since(req.SentAt) > requestTimeout {
 			delete(rm.requests, req.ID)
 			req.Timeout()
 		}

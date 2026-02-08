@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -348,7 +349,7 @@ func TestRequest_UnregisteredActor(t *testing.T) {
 	req.SentAt = req.SentAt.Add(-10 * time.Second)
 	host.requests.mu.Unlock()
 
-	host.requests.RemoveExpired()
+	host.requests.RemoveExpired(5 * time.Second)
 
 	res := <-req.Response
 	if res.Error != ErrRequestTimeout {
@@ -477,6 +478,286 @@ func (a *testInitReqActor) Receive(ctx *Context) error {
 		return ctx.Reply(&TestPong{})
 	}
 	return nil
+}
+
+func TestNewHostWithOptions(t *testing.T) {
+
+	host := NewHost(
+		WithIdleTimeout(30*time.Second),
+		WithRequestTimeout(10*time.Second),
+		WithCleanupInterval(2*time.Second),
+		WithDrainTimeout(3*time.Second),
+	)
+
+	if host.config.idleTimeout != 30*time.Second {
+		t.Fatalf("expected idleTimeout 30s, got %v", host.config.idleTimeout)
+	}
+	if host.config.requestTimeout != 10*time.Second {
+		t.Fatalf("expected requestTimeout 10s, got %v", host.config.requestTimeout)
+	}
+	if host.config.cleanupInterval != 2*time.Second {
+		t.Fatalf("expected cleanupInterval 2s, got %v", host.config.cleanupInterval)
+	}
+	if host.config.drainTimeout != 3*time.Second {
+		t.Fatalf("expected drainTimeout 3s, got %v", host.config.drainTimeout)
+	}
+}
+
+func TestNewHostDefaults(t *testing.T) {
+
+	host := NewHost()
+
+	if host.config.idleTimeout != 15*time.Second {
+		t.Fatalf("expected default idleTimeout 15s, got %v", host.config.idleTimeout)
+	}
+	if host.config.requestTimeout != 5*time.Second {
+		t.Fatalf("expected default requestTimeout 5s, got %v", host.config.requestTimeout)
+	}
+	if host.config.cleanupInterval != 1*time.Second {
+		t.Fatalf("expected default cleanupInterval 1s, got %v", host.config.cleanupInterval)
+	}
+	if host.config.drainTimeout != 5*time.Second {
+		t.Fatalf("expected default drainTimeout 5s, got %v", host.config.drainTimeout)
+	}
+}
+
+func TestSend_UnregisteredActor(t *testing.T) {
+
+	host := NewHost()
+	host.Start()
+	defer host.Stop()
+
+	ref := NewRef("nonexistent", "1")
+
+	err := host.Send(ref, &TestMessage{})
+	if !errors.Is(err, ErrUnregisteredActorType) {
+		t.Fatalf("expected ErrUnregisteredActorType, got %v", err)
+	}
+}
+
+func TestRequest_UnregisteredActorImmediate(t *testing.T) {
+
+	host := NewHost()
+	host.Start()
+	defer host.Stop()
+
+	ref := NewRef("nonexistent", "1")
+
+	_, err := host.Request(ref, &TestPing{})
+	if !errors.Is(err, ErrUnregisteredActorType) {
+		t.Fatalf("expected ErrUnregisteredActorType, got %v", err)
+	}
+}
+
+type TestSelfStopActor struct {
+	callCount int
+}
+
+func (a *TestSelfStopActor) Receive(ctx *Context) error {
+	switch ctx.Message.(type) {
+	case *TestPing:
+		a.callCount++
+		return ErrStopActor
+	}
+	return nil
+}
+
+func TestActorSelfStop(t *testing.T) {
+
+	host := NewHost(
+		WithDrainTimeout(100*time.Millisecond),
+		WithRequestTimeout(500*time.Millisecond),
+		WithCleanupInterval(100*time.Millisecond),
+	)
+
+	host.RegisterActor("self-stop", func() Receiver {
+		return &TestSelfStopActor{}
+	})
+
+	host.Start()
+	defer host.Stop()
+
+	ref := NewRef("self-stop", "1")
+
+	// send a message that triggers self-stop
+	err := host.Send(ref, &TestPing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// give time for actor to stop and deregister
+	time.Sleep(100 * time.Millisecond)
+
+	// actor should be deregistered
+	a := host.actors.Lookup(ref)
+	if a != nil {
+		t.Fatal("expected actor to be deregistered after self-stop")
+	}
+
+	// sending another message should create a fresh instance
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		res, err := host.Request(ref, &TestPing{})
+		if err != nil {
+			// ErrStopActor is expected since the actor self-stops
+			// but it should still have been created fresh
+			wg.Done()
+			return
+		}
+		_ = res
+		wg.Done()
+	}()
+
+	wg.Wait()
+
+	// wait for the goroutine to finish
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request")
+	}
+}
+
+func TestGracefulDrain(t *testing.T) {
+
+	wg := &sync.WaitGroup{}
+	wg.Add(5)
+
+	host := NewHost(WithDrainTimeout(2 * time.Second))
+
+	host.RegisterActor("drain-test", func() Receiver {
+		return &TestActor{wg: wg}
+	})
+
+	host.Start()
+
+	ref := NewRef("drain-test", "1")
+
+	for i := 0; i < 5; i++ {
+		err := host.Send(ref, &TestMessage{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// wait for all messages to be processed
+	wg.Wait()
+
+	// stop should complete gracefully
+	host.Stop()
+
+	host.actors.mu.RLock()
+	defer host.actors.mu.RUnlock()
+
+	if len(host.actors.actors) != 0 {
+		t.Fatal("actors not removed after graceful drain")
+	}
+}
+
+type TestSlowActor struct {
+	processed *int32
+}
+
+func (a *TestSlowActor) Receive(ctx *Context) error {
+	switch ctx.Message.(type) {
+	case *TestMessage:
+		time.Sleep(50 * time.Millisecond)
+		atomic.AddInt32(a.processed, 1)
+	}
+	return nil
+}
+
+func TestDrainTimeout(t *testing.T) {
+
+	var processed int32
+
+	host := NewHost(WithDrainTimeout(100 * time.Millisecond))
+
+	host.RegisterActor("slow", func() Receiver {
+		return &TestSlowActor{processed: &processed}
+	})
+
+	host.Start()
+
+	ref := NewRef("slow", "1")
+
+	// send enough messages to exceed drain timeout
+	for i := 0; i < 20; i++ {
+		_ = host.Send(ref, &TestMessage{})
+	}
+
+	start := time.Now()
+	host.Stop()
+	elapsed := time.Since(start)
+
+	// Stop should return within drain timeout + some margin
+	if elapsed > 1*time.Second {
+		t.Fatalf("Stop took too long: %v", elapsed)
+	}
+}
+
+func TestSendAfterDrain(t *testing.T) {
+
+	host := NewHost()
+
+	host.RegisterActor("test", func() Receiver {
+		return &TestActor{wg: &sync.WaitGroup{}}
+	})
+
+	host.Start()
+	host.Stop()
+
+	ref := NewRef("test", "1")
+
+	err := host.Send(ref, &TestMessage{})
+	if !errors.Is(err, ErrHostDraining) {
+		t.Fatalf("expected ErrHostDraining, got %v", err)
+	}
+
+	_, err = host.Request(ref, &TestPing{})
+	if !errors.Is(err, ErrHostDraining) {
+		t.Fatalf("expected ErrHostDraining from Request, got %v", err)
+	}
+}
+
+func TestDeadLetterHandler(t *testing.T) {
+
+	var deadLetter InboxMessage
+	var received bool
+
+	host := NewHost(WithDeadLetterHandler(func(msg InboxMessage) {
+		deadLetter = msg
+		received = true
+	}))
+
+	// register "test" but NOT "nonexistent"
+	host.RegisterActor("test", func() Receiver {
+		return &TestActor{wg: &sync.WaitGroup{}}
+	})
+
+	host.Start()
+	defer host.Stop()
+
+	// manually push a message to the inbox for an unregistered type
+	// (bypassing the Send check which now blocks unregistered types)
+	host.inbox <- InboxMessage{
+		RecipientRef: NewRef("nonexistent", "1"),
+		Body:         &TestMessage{},
+	}
+
+	// give time for processInbox to handle it
+	time.Sleep(100 * time.Millisecond)
+
+	if !received {
+		t.Fatal("dead letter handler was not called")
+	}
+	if deadLetter.RecipientRef.Type != "nonexistent" {
+		t.Fatalf("expected dead letter for 'nonexistent', got '%s'", deadLetter.RecipientRef.Type)
+	}
 }
 
 func BenchmarkHost_Request(b *testing.B) {

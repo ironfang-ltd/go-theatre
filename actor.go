@@ -1,12 +1,15 @@
 package theatre
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
 )
+
+var ErrStopActor = fmt.Errorf("stop actor")
 
 type Receiver interface {
 	Receive(ctx *Context) error
@@ -27,6 +30,7 @@ type Actor struct {
 	shutdown    chan bool
 	lastMessage int64
 	status      int64
+	onStop      func(Ref)
 }
 
 func NewActor(host *Host, ref Ref, receiver Receiver) *Actor {
@@ -35,7 +39,7 @@ func NewActor(host *Host, ref Ref, receiver Receiver) *Actor {
 		ref:      ref,
 		receiver: receiver,
 		inbox:    make(chan InboxMessage),
-		shutdown: make(chan bool),
+		shutdown: make(chan bool, 1),
 	}
 }
 
@@ -55,11 +59,17 @@ func (a *Actor) Send(msg InboxMessage) {
 
 func (a *Actor) Receive() {
 
+	selfStopped := false
+
 	defer (func() {
 
 		slog.Info("actor shutting down", "type", a.ref.Type, "id", a.ref.ID)
 
 		atomic.CompareAndSwapInt64(&a.status, int64(ActorStatusActive), int64(ActorStatusInactive))
+
+		if selfStopped && a.onStop != nil {
+			a.onStop(a.ref)
+		}
 
 		a.shutdown <- true
 	})()
@@ -84,6 +94,10 @@ func (a *Actor) Receive() {
 		err := a.receive(&ctx)
 
 		if err != nil {
+			if errors.Is(err, ErrStopActor) {
+				selfStopped = true
+				break
+			}
 			slog.Error("actor receive error", "type", a.ref.Type, "id", a.ref.ID, "error", err)
 			a.replyWithError(msg, err)
 		}
@@ -128,12 +142,12 @@ func (a *Actor) replyWithError(msg InboxMessage, err error) {
 
 	// if there is a reply ID, send an error response
 	if msg.ReplyID != 0 {
-		a.host.outbox <- OutboxMessage{
+		a.host.sendInternal(OutboxMessage{
 			RecipientHostRef: msg.SenderHostRef,
 			RecipientRef:     msg.RecipientRef,
 			IsReply:          true,
 			ReplyID:          msg.ReplyID,
 			Error:            err,
-		}
+		})
 	}
 }

@@ -78,7 +78,7 @@ func TestRequestManager_RemoveExpired(t *testing.T) {
 	req.SentAt = time.Now().Add(-10 * time.Second)
 	rm.mu.Unlock()
 
-	rm.RemoveExpired()
+	rm.RemoveExpired(5 * time.Second)
 
 	// request should be removed from the map
 	got := rm.Get(req.ID)
@@ -108,7 +108,7 @@ func TestRequestManager_RemoveExpiredKeepsFresh(t *testing.T) {
 	expired.SentAt = time.Now().Add(-10 * time.Second)
 	rm.mu.Unlock()
 
-	rm.RemoveExpired()
+	rm.RemoveExpired(5 * time.Second)
 
 	if rm.Get(fresh.ID) == nil {
 		t.Fatal("fresh request should not have been removed")
