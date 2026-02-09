@@ -235,18 +235,207 @@ func TestHandshakeRoundTrip(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- writeHandshake(c1, "host-alpha")
+		errCh <- writeHandshake(c1, "host-alpha", "127.0.0.1:9000")
 	}()
 
-	got, err := readHandshake(c2)
+	gotID, gotAddr, err := readHandshake(c2)
 	if err != nil {
 		t.Fatalf("readHandshake: %v", err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("writeHandshake: %v", err)
 	}
-	if got != "host-alpha" {
-		t.Fatalf("hostID: got %q, want %q", got, "host-alpha")
+	if gotID != "host-alpha" {
+		t.Fatalf("hostID: got %q, want %q", gotID, "host-alpha")
+	}
+	if gotAddr != "127.0.0.1:9000" {
+		t.Fatalf("addr: got %q, want %q", gotAddr, "127.0.0.1:9000")
+	}
+}
+
+func TestHandshakeRoundTrip_WithAddress(t *testing.T) {
+	// Verify that various address values round-trip correctly,
+	// including an empty address.
+	cases := []struct {
+		name   string
+		hostID string
+		addr   string
+	}{
+		{"with-address", "host-beta", "10.0.0.1:4000"},
+		{"empty-address", "host-gamma", ""},
+		{"ipv6-address", "host-delta", "[::1]:8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+			defer c2.Close()
+
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- writeHandshake(c1, tc.hostID, tc.addr)
+			}()
+
+			gotID, gotAddr, err := readHandshake(c2)
+			if err != nil {
+				t.Fatalf("readHandshake: %v", err)
+			}
+			if err := <-errCh; err != nil {
+				t.Fatalf("writeHandshake: %v", err)
+			}
+			if gotID != tc.hostID {
+				t.Errorf("hostID: got %q, want %q", gotID, tc.hostID)
+			}
+			if gotAddr != tc.addr {
+				t.Errorf("addr: got %q, want %q", gotAddr, tc.addr)
+			}
+		})
+	}
+}
+
+func TestTransport_PeerAddressFromHandshake(t *testing.T) {
+	// Verify that the inbound peer's stored address is the remote's
+	// advertised listen address, not the ephemeral client port.
+	received := make(chan struct{}, 1)
+
+	handlerB := func(from string, env TransportEnvelope) {
+		if _, ok := env.Payload.(*TransportPing); ok {
+			received <- struct{}{}
+		}
+	}
+
+	tA, err := NewTransport("host-a", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTransport A: %v", err)
+	}
+	tA.Start()
+	defer tA.Stop()
+
+	tB, err := NewTransport("host-b", "127.0.0.1:0", handlerB)
+	if err != nil {
+		t.Fatalf("NewTransport B: %v", err)
+	}
+	tB.Start()
+	defer tB.Stop()
+
+	// A sends a ping to B, which establishes an outbound connection from A→B
+	// and an inbound connection on B from A.
+	pingEnv, err := Envelope(TransportPing{})
+	if err != nil {
+		t.Fatalf("Envelope: %v", err)
+	}
+	if err := tA.SendTo("host-b", tB.Addr(), pingEnv); err != nil {
+		t.Fatalf("SendTo: %v", err)
+	}
+
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for ping")
+	}
+
+	// Check that B's peer entry for "host-a" has A's listen address,
+	// not an ephemeral port.
+	v, ok := tB.peers.Load("host-a")
+	if !ok {
+		t.Fatal("host-a not found in tB peers")
+	}
+	peerA := v.(*transportPeer)
+	peerA.mu.Lock()
+	addr := peerA.address
+	peerA.mu.Unlock()
+
+	if addr != tA.Addr() {
+		t.Errorf("peer address: got %q, want %q (tA listen addr)", addr, tA.Addr())
+	}
+}
+
+// --- simultaneous connect tie-breaking ---
+
+func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
+	// When both sides dial each other simultaneously, the higher-ID host
+	// keeps its outbound and rejects the inbound. The lower-ID host accepts
+	// the inbound. This should converge to one connection per pair with no
+	// cascading reconnects.
+	receivedA := make(chan struct{}, 10)
+	receivedB := make(chan struct{}, 10)
+
+	handlerA := func(from string, env TransportEnvelope) {
+		if _, ok := env.Payload.(*TransportPing); ok {
+			receivedA <- struct{}{}
+		}
+	}
+	handlerB := func(from string, env TransportEnvelope) {
+		if _, ok := env.Payload.(*TransportPing); ok {
+			receivedB <- struct{}{}
+		}
+	}
+
+	// "host-b" > "host-a" lexicographically, so host-b wins tie-breaking.
+	tA, err := NewTransport("host-a", "127.0.0.1:0", handlerA)
+	if err != nil {
+		t.Fatalf("NewTransport A: %v", err)
+	}
+	tA.Start()
+	defer tA.Stop()
+
+	tB, err := NewTransport("host-b", "127.0.0.1:0", handlerB)
+	if err != nil {
+		t.Fatalf("NewTransport B: %v", err)
+	}
+	tB.Start()
+	defer tB.Stop()
+
+	pingEnv, _ := Envelope(TransportPing{})
+
+	// Trigger simultaneous connect: both sides dial at the same time.
+	errCh := make(chan error, 2)
+	go func() { errCh <- tA.SendTo("host-b", tB.Addr(), pingEnv) }()
+	go func() { errCh <- tB.SendTo("host-a", tA.Addr(), pingEnv) }()
+
+	// Both sends should succeed (possibly after one reconnect cycle).
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("SendTo %d: %v", i, err)
+		}
+	}
+
+	// Both sides should receive the ping.
+	for i := 0; i < 1; i++ {
+		select {
+		case <-receivedA:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for ping on A")
+		}
+	}
+	for i := 0; i < 1; i++ {
+		select {
+		case <-receivedB:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for ping on B")
+		}
+	}
+
+	// Let connections stabilize.
+	time.Sleep(100 * time.Millisecond)
+
+	// Send another round — should work without errors on stable connections.
+	if err := tA.SendTo("host-b", tB.Addr(), pingEnv); err != nil {
+		t.Fatalf("second SendTo A→B: %v", err)
+	}
+	if err := tB.SendTo("host-a", tA.Addr(), pingEnv); err != nil {
+		t.Fatalf("second SendTo B→A: %v", err)
+	}
+
+	select {
+	case <-receivedB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for second ping on B")
+	}
+	select {
+	case <-receivedA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for second ping on A")
 	}
 }
 

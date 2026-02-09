@@ -2,11 +2,10 @@ package theatre
 
 import (
 	"testing"
-	"time"
 )
 
 func TestPlacementCache_PutGet(t *testing.T) {
-	pc := newPlacementCache(10 * time.Second)
+	pc := newPlacementCache(10)
 	ref := NewRef("player", "1")
 
 	_, ok := pc.Get(ref)
@@ -25,7 +24,7 @@ func TestPlacementCache_PutGet(t *testing.T) {
 }
 
 func TestPlacementCache_TTLExpiry(t *testing.T) {
-	pc := newPlacementCache(50 * time.Millisecond)
+	pc := newPlacementCache(1) // 1 second TTL
 	ref := NewRef("player", "2")
 
 	pc.Put(ref, PlacementEntry{HostID: "host-b", Address: "127.0.0.1:7001", Epoch: 1})
@@ -35,7 +34,9 @@ func TestPlacementCache_TTLExpiry(t *testing.T) {
 		t.Fatal("expected hit before TTL")
 	}
 
-	time.Sleep(60 * time.Millisecond)
+	// Advance coarse clock past the TTL.
+	coarseNow.Add(2)
+	defer coarseNow.Add(-2)
 
 	_, ok = pc.Get(ref)
 	if ok {
@@ -44,7 +45,7 @@ func TestPlacementCache_TTLExpiry(t *testing.T) {
 }
 
 func TestPlacementCache_Evict(t *testing.T) {
-	pc := newPlacementCache(10 * time.Second)
+	pc := newPlacementCache(10)
 	ref := NewRef("player", "3")
 
 	pc.Put(ref, PlacementEntry{HostID: "host-c", Address: "127.0.0.1:7002", Epoch: 2})
@@ -58,7 +59,7 @@ func TestPlacementCache_Evict(t *testing.T) {
 }
 
 func TestPlacementCache_EpochOverwrite(t *testing.T) {
-	pc := newPlacementCache(10 * time.Second)
+	pc := newPlacementCache(10)
 	ref := NewRef("player", "4")
 
 	pc.Put(ref, PlacementEntry{HostID: "host-a", Address: "127.0.0.1:7000", Epoch: 1})

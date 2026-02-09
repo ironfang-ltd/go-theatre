@@ -2,41 +2,49 @@ package theatre
 
 import (
 	"sync"
-	"time"
 )
+
+const placementShards = 64
 
 // PlacementEntry records where an actor is believed to be running.
 type PlacementEntry struct {
 	HostID   string
 	Address  string
 	Epoch    int64
-	CachedAt time.Time
+	cachedAt int64 // coarse clock seconds (internal)
+}
+
+type placementShard struct {
+	mu sync.RWMutex
+	m  map[Ref]PlacementEntry
 }
 
 // PlacementCache maps actor refs to their last-known host location.
-// Thread-safe. Entries expire after the configured TTL.
+// Thread-safe. Entries expire after the configured TTL. Uses 64 shards
+// for high-concurrency reads (same pattern as ActorRegistry).
 type PlacementCache struct {
-	mu      sync.RWMutex
-	entries map[Ref]PlacementEntry
-	ttl     time.Duration
+	shards [placementShards]placementShard
+	ttl    int64 // seconds, compared against coarseNow
 }
 
-func newPlacementCache(ttl time.Duration) *PlacementCache {
-	return &PlacementCache{
-		entries: make(map[Ref]PlacementEntry),
-		ttl:     ttl,
+func newPlacementCache(ttl int64) *PlacementCache {
+	pc := &PlacementCache{ttl: ttl}
+	for i := range pc.shards {
+		pc.shards[i].m = make(map[Ref]PlacementEntry)
 	}
+	return pc
 }
 
 // Get returns the cached placement for ref, or false if missing/expired.
 func (pc *PlacementCache) Get(ref Ref) (PlacementEntry, bool) {
-	pc.mu.RLock()
-	e, ok := pc.entries[ref]
-	pc.mu.RUnlock()
+	s := &pc.shards[refShard(ref)]
+	s.mu.RLock()
+	e, ok := s.m[ref]
+	s.mu.RUnlock()
 	if !ok {
 		return PlacementEntry{}, false
 	}
-	if time.Since(e.CachedAt) > pc.ttl {
+	if coarseNow.Load()-e.cachedAt > pc.ttl {
 		pc.Evict(ref)
 		return PlacementEntry{}, false
 	}
@@ -45,23 +53,29 @@ func (pc *PlacementCache) Get(ref Ref) (PlacementEntry, bool) {
 
 // Put stores a placement entry for ref.
 func (pc *PlacementCache) Put(ref Ref, entry PlacementEntry) {
-	entry.CachedAt = time.Now()
-	pc.mu.Lock()
-	pc.entries[ref] = entry
-	pc.mu.Unlock()
+	entry.cachedAt = coarseNow.Load()
+	s := &pc.shards[refShard(ref)]
+	s.mu.Lock()
+	s.m[ref] = entry
+	s.mu.Unlock()
 }
 
 // Evict removes the placement entry for ref.
 func (pc *PlacementCache) Evict(ref Ref) {
-	pc.mu.Lock()
-	delete(pc.entries, ref)
-	pc.mu.Unlock()
+	s := &pc.shards[refShard(ref)]
+	s.mu.Lock()
+	delete(s.m, ref)
+	s.mu.Unlock()
 }
 
 // Len returns the number of entries in the cache (including potentially expired ones).
 func (pc *PlacementCache) Len() int {
-	pc.mu.RLock()
-	n := len(pc.entries)
-	pc.mu.RUnlock()
+	n := 0
+	for i := range pc.shards {
+		s := &pc.shards[i]
+		s.mu.RLock()
+		n += len(s.m)
+		s.mu.RUnlock()
+	}
 	return n
 }

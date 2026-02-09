@@ -28,7 +28,7 @@ func (m *Host) SetTransport(t *Transport) {
 // Must be called before Start.
 func (m *Host) SetCluster(c *Cluster) {
 	m.cluster = c
-	m.placementCache = newPlacementCache(m.config.placementTTL)
+	m.placementCache = newPlacementCache(int64(m.config.placementTTL.Seconds()))
 }
 
 // HandleTransportMessage is the TransportHandler for this host.

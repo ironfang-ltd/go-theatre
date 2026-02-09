@@ -8,21 +8,38 @@ package theatre
 //   - Wire format: [4-byte big-endian payload length][1-byte tag][gob payload].
 //     Payload length covers the tag byte plus the gob bytes.
 //   - A read error tears down the connection; the next SendTo reconnects.
-//   - writeFrame builds the entire frame in memory and issues a single
-//     conn.Write under the peer mutex, so concurrent senders cannot interleave.
+//   - Each peer has a dedicated writer goroutine that reads from a send
+//     channel and writes frames. This eliminates write contention — only
+//     one goroutine writes to each connection.
+//   - The writer goroutine uses a bufio.Writer for automatic batching:
+//     multiple frames accumulate in the buffer and flush in a single
+//     conn.Write syscall when no more messages are immediately available.
 //   - Every conn.Write is bounded by transportWriteTimeout. On timeout or
 //     error the connection is closed and cleared, allowing reconnect on next send.
+//   - conn.Read uses a 64KB bufio.Reader. Read deadlines are refreshed every
+//     ~10s (not per frame) using the coarse clock, detecting half-open TCP.
+//
+// Handshake format:
+//
+//	[2-byte big-endian hostID length][hostID UTF-8 bytes]
+//	[2-byte big-endian addr length][addr UTF-8 bytes]
+//
+// The addr field carries the sender's advertised listen address so the
+// receiver stores it for future outbound dials (instead of the ephemeral
+// client port from conn.RemoteAddr()).
 //
 // Handshake direction:
 //   - Outbound (dialer):  write handshake → read handshake
 //   - Inbound  (listener): read handshake → write handshake
-//   - If both sides connect simultaneously, each side ends up with an
-//     inbound connection from the other. The inbound handler replaces any
-//     existing outbound connection for that hostID (old conn is closed,
-//     its readLoop exits on EOF). This converges to one usable connection
-//     per direction without requiring a tie-breaking protocol.
+//   - Both dial and handshake are bounded by dedicated timeouts.
+//   - If both sides connect simultaneously, deterministic tie-breaking
+//     prevents cascading reconnects: the host with the lexicographically
+//     higher hostID keeps its outbound connection and rejects the inbound;
+//     the lower-ID host accepts the inbound, replacing its outbound.
+//     This converges to exactly one connection per peer pair in one round.
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
@@ -34,10 +51,27 @@ import (
 	"time"
 )
 
+// transportDialTimeout bounds net.DialTimeout when connecting to a peer.
+const transportDialTimeout = 5 * time.Second
+
+// transportHandshakeTimeout bounds the handshake exchange (read + write)
+// after a connection is established. Prevents slow/malicious peers from
+// holding a connection indefinitely before identifying themselves.
+const transportHandshakeTimeout = 5 * time.Second
+
+// transportReadTimeout is the deadline for each frame read. If no data
+// arrives within this window the connection is torn down. This detects
+// half-open TCP connections and acts as a natural idle-connection reaper.
+// The next SendTo call reconnects automatically.
+const transportReadTimeout = 30 * time.Second
+
 // transportWriteTimeout bounds every conn.Write. If the peer stops reading,
 // the write will fail after this duration instead of blocking forever.
 // This is required for correct freeze/drain behavior.
 const transportWriteTimeout = 5 * time.Second
+
+// peerSendBuffer is the capacity of each peer's outbound message channel.
+const peerSendBuffer = 4096
 
 // TransportHandler is called for every inbound message.
 // fromHostID is the remote host that sent the message.
@@ -47,8 +81,7 @@ type Transport struct {
 	hostID   string
 	listener net.Listener
 
-	mu    sync.Mutex
-	peers map[string]*transportPeer
+	peers sync.Map // map[string]*transportPeer
 
 	handler TransportHandler
 
@@ -79,11 +112,17 @@ type transportPeer struct {
 	hostID  string
 	address string
 
-	mu       sync.Mutex // guards conn writes, conn lifecycle, and encoder
+	mu       sync.Mutex // guards conn lifecycle and encoder (writeFrame compat)
 	conn     net.Conn
-	enc      *gob.Encoder   // per-connection encoder; nil until first write
-	encBuf   bytes.Buffer   // backing buffer for enc
-	frameBuf []byte         // reusable frame buffer (avoids alloc per write)
+	outbound bool         // true if we dialed (getOrConnect); false if they dialed (handleInbound)
+	enc      *gob.Encoder // per-connection encoder; nil until first write (writeFrame compat)
+	encBuf   bytes.Buffer // backing buffer for enc (writeFrame compat)
+	frameBuf []byte       // reusable frame buffer (writeFrame compat)
+
+	// Per-peer writer goroutine. SendTo pushes envelopes to sendCh;
+	// the peerWriter goroutine reads and writes them with zero contention.
+	sendCh    chan TransportEnvelope
+	writerOnce sync.Once
 }
 
 // NewTransport creates a transport that listens on listenAddr.
@@ -96,7 +135,6 @@ func NewTransport(hostID, listenAddr string, handler TransportHandler) (*Transpo
 	return &Transport{
 		hostID:   hostID,
 		listener: ln,
-		peers:    make(map[string]*transportPeer),
 		handler:  handler,
 		done:     make(chan struct{}),
 	}, nil
@@ -120,15 +158,15 @@ func (t *Transport) Stop() {
 		close(t.done)
 		t.listener.Close()
 
-		t.mu.Lock()
-		for _, p := range t.peers {
+		t.peers.Range(func(key, value any) bool {
+			p := value.(*transportPeer)
 			p.mu.Lock()
 			if p.conn != nil {
 				p.conn.Close()
 			}
 			p.mu.Unlock()
-		}
-		t.mu.Unlock()
+			return true
+		})
 
 		t.wg.Wait()
 	})
@@ -147,6 +185,9 @@ func (t *Transport) SetSendFilter(fn func(string) bool) {
 // SendTo sends a message to the specified host. If no connection exists,
 // it dials address to establish one. The address is only used for the
 // initial dial; subsequent calls for the same hostID reuse the connection.
+//
+// Messages are queued in a per-peer channel and written by a dedicated
+// goroutine, so SendTo returns as soon as the message is enqueued.
 func (t *Transport) SendTo(hostID, address string, env TransportEnvelope) error {
 	t.filterMu.RLock()
 	filter := t.sendFilter
@@ -159,7 +200,19 @@ func (t *Transport) SendTo(hostID, address string, env TransportEnvelope) error 
 	if err != nil {
 		return err
 	}
-	return t.writeFrame(p, env)
+
+	// Start writer goroutine (once per peer lifetime).
+	p.writerOnce.Do(func() {
+		t.wg.Add(1)
+		go t.peerWriter(p)
+	})
+
+	select {
+	case p.sendCh <- env:
+		return nil
+	case <-t.done:
+		return fmt.Errorf("transport: shutting down")
+	}
 }
 
 // --- accept loop ---
@@ -184,41 +237,83 @@ func (t *Transport) acceptLoop() {
 
 // handleInbound processes a new inbound TCP connection.
 //
-// Handshake direction (inbound): read remote hostID first, then send ours.
+// Handshake direction (inbound): read remote hostID+addr first, then send ours.
 // This is the mirror of the outbound path in getOrConnect which writes first.
 func (t *Transport) handleInbound(conn net.Conn) {
 	defer t.wg.Done()
 
+	// Set a deadline covering the entire handshake exchange.
+	conn.SetDeadline(time.Now().Add(transportHandshakeTimeout))
+
 	// Inbound handshake: read → write (opposite of outbound: write → read).
-	remoteID, err := readHandshake(conn)
+	remoteID, remoteAddr, err := readHandshake(conn)
 	if err != nil {
 		slog.Error("transport handshake read failed", "error", err)
 		conn.Close()
 		return
 	}
-	if err := writeHandshake(conn, t.hostID); err != nil {
+	if err := writeHandshake(conn, t.hostID, t.Addr()); err != nil {
 		slog.Error("transport handshake write failed", "error", err)
 		conn.Close()
 		return
 	}
 
+	// Clear the handshake deadline; readLoop sets per-frame deadlines.
+	conn.SetDeadline(time.Time{})
+
 	slog.Info("transport peer connected", "direction", "inbound", "remote", remoteID)
 
-	// Register the inbound connection as a peer.
-	// If an outbound connection already exists for this hostID, the inbound
-	// connection replaces it (see file-level comment on simultaneous connect).
-	t.mu.Lock()
-	p, exists := t.peers[remoteID]
-	if !exists {
-		p = &transportPeer{hostID: remoteID, address: conn.RemoteAddr().String()}
-		t.peers[remoteID] = p
+	// Use the advertised listen address from the handshake (not the
+	// ephemeral client port from conn.RemoteAddr()). This is the address
+	// we would need to dial back to reach this peer.
+	peerAddr := remoteAddr
+	if peerAddr == "" {
+		peerAddr = conn.RemoteAddr().String()
 	}
-	t.mu.Unlock()
+
+	// Register the inbound connection as a peer.
+	var p *transportPeer
+	if v, ok := t.peers.Load(remoteID); ok {
+		p = v.(*transportPeer)
+	} else {
+		newP := &transportPeer{
+			hostID:  remoteID,
+			address: peerAddr,
+			sendCh:  make(chan TransportEnvelope, peerSendBuffer),
+		}
+		actual, _ := t.peers.LoadOrStore(remoteID, newP)
+		p = actual.(*transportPeer)
+	}
 
 	p.mu.Lock()
+
+	// Simultaneous connect tie-breaking: when both sides dial each other,
+	// each receives an inbound from the other. Without tie-breaking, both
+	// sides replace their outbound with the inbound, causing cascading
+	// reconnects. Instead, the host with the higher hostID wins: it keeps
+	// its outbound for writing but drains the inbound (reads any data the
+	// remote already sent through it). The draining readLoop exits once
+	// the remote closes its end (after it accepts our inbound and replaces
+	// its own outbound). The lower-ID host accepts the inbound normally.
+	if p.conn != nil && p.outbound && t.hostID > remoteID {
+		if peerAddr != "" {
+			p.address = peerAddr
+		}
+		p.mu.Unlock()
+		slog.Info("transport simultaneous connect (keeping outbound, draining inbound)",
+			"remote", remoteID)
+		t.readLoop(remoteID, conn)
+		conn.Close()
+		return
+	}
+
 	old := p.conn
 	p.conn = conn
-	p.enc = nil // new connection; reset encoder type cache
+	p.outbound = false
+	p.enc = nil // new connection; reset encoder type cache (writeFrame compat)
+	if peerAddr != "" {
+		p.address = peerAddr // update address on reconnect
+	}
 	p.mu.Unlock()
 
 	if old != nil {
@@ -235,13 +330,25 @@ func (t *Transport) handleInbound(conn net.Conn) {
 // Handshake direction (outbound): write our hostID first, then read theirs.
 // This is the mirror of the inbound path in handleInbound which reads first.
 func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error) {
-	t.mu.Lock()
-	p, exists := t.peers[hostID]
-	if !exists {
-		p = &transportPeer{hostID: hostID, address: address}
-		t.peers[hostID] = p
+	// Fast path: peer exists and is connected (lock-free map lookup).
+	if v, ok := t.peers.Load(hostID); ok {
+		p := v.(*transportPeer)
+		p.mu.Lock()
+		connected := p.conn != nil
+		p.mu.Unlock()
+		if connected {
+			return p, nil
+		}
 	}
-	t.mu.Unlock()
+
+	// Slow path: create peer entry if needed.
+	newP := &transportPeer{
+		hostID:  hostID,
+		address: address,
+		sendCh:  make(chan TransportEnvelope, peerSendBuffer),
+	}
+	actual, _ := t.peers.LoadOrStore(hostID, newP)
+	p := actual.(*transportPeer)
 
 	p.mu.Lock()
 	if p.conn != nil {
@@ -249,23 +356,31 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 		return p, nil
 	}
 
+	// Update address if provided (may differ from initial creation).
+	if address != "" {
+		p.address = address
+	}
+
 	// Dial and handshake while holding the peer lock so only one goroutine
 	// connects at a time. The readLoop goroutine is started after unlocking
 	// to avoid a deadlock if the first read fails immediately.
-	conn, err := net.Dial("tcp", address)
+	conn, err := net.DialTimeout("tcp", p.address, transportDialTimeout)
 	if err != nil {
 		p.mu.Unlock()
-		return nil, fmt.Errorf("transport dial %s (%s): %w", hostID, address, err)
+		return nil, fmt.Errorf("transport dial %s (%s): %w", hostID, p.address, err)
 	}
 
+	// Set a deadline covering the entire handshake exchange.
+	conn.SetDeadline(time.Now().Add(transportHandshakeTimeout))
+
 	// Outbound handshake: write → read (opposite of inbound: read → write).
-	if err := writeHandshake(conn, t.hostID); err != nil {
+	if err := writeHandshake(conn, t.hostID, t.Addr()); err != nil {
 		conn.Close()
 		p.mu.Unlock()
 		return nil, fmt.Errorf("transport handshake: %w", err)
 	}
 
-	remoteID, err := readHandshake(conn)
+	remoteID, _, err := readHandshake(conn)
 	if err != nil {
 		conn.Close()
 		p.mu.Unlock()
@@ -278,9 +393,13 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 		return nil, fmt.Errorf("transport handshake: expected host %q, got %q", hostID, remoteID)
 	}
 
+	// Clear the handshake deadline; readLoop sets per-frame deadlines.
+	conn.SetDeadline(time.Time{})
+
 	p.conn = conn
-	p.enc = nil // new connection; reset encoder type cache
-	p.mu.Unlock() // unlock before starting the read goroutine
+	p.outbound = true
+	p.enc = nil // new connection; reset encoder type cache (writeFrame compat)
+	p.mu.Unlock()
 
 	slog.Info("transport peer connected", "direction", "outbound", "remote", hostID, "address", address)
 
@@ -293,6 +412,115 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 	return p, nil
 }
 
+// --- per-peer writer goroutine ---
+
+// peerWriter is the dedicated write goroutine for a single peer.
+// It reads envelopes from p.sendCh and writes them to the connection.
+// A bufio.Writer batches frames: multiple envelopes are encoded into the
+// buffer and flushed in a single conn.Write when no more are immediately
+// available. Since only this goroutine writes to the connection, there
+// is zero write contention.
+func (t *Transport) peerWriter(p *transportPeer) {
+	defer t.wg.Done()
+
+	var (
+		enc      *gob.Encoder
+		encBuf   bytes.Buffer
+		frameBuf []byte
+		bw       *bufio.Writer
+		curConn  net.Conn
+	)
+
+	for {
+		var env TransportEnvelope
+		select {
+		case env = <-p.sendCh:
+		case <-t.done:
+			return
+		}
+
+		// Snapshot current connection.
+		p.mu.Lock()
+		conn := p.conn
+		p.mu.Unlock()
+
+		if conn == nil {
+			continue // dropped; next SendTo will reconnect
+		}
+
+		// Reset encoder and writer on connection change.
+		if conn != curConn {
+			curConn = conn
+			encBuf.Reset()
+			enc = gob.NewEncoder(&encBuf)
+			bw = bufio.NewWriterSize(conn, 65536)
+		}
+
+		conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
+
+		// Write first frame.
+		if err := writeFrameTo(bw, enc, &encBuf, &frameBuf, env); err != nil {
+			t.closePeerConn(p, conn)
+			curConn = nil
+
+			// The connection may have been replaced by handleInbound
+			// (simultaneous connect tie-breaking). Retry once with
+			// the new connection if available.
+			p.mu.Lock()
+			conn = p.conn
+			p.mu.Unlock()
+			if conn == nil {
+				continue
+			}
+			curConn = conn
+			encBuf.Reset()
+			enc = gob.NewEncoder(&encBuf)
+			bw = bufio.NewWriterSize(conn, 65536)
+			conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
+			if err := writeFrameTo(bw, enc, &encBuf, &frameBuf, env); err != nil {
+				t.closePeerConn(p, conn)
+				curConn = nil
+				continue
+			}
+		}
+
+		// Drain additional available messages for batching.
+	drain:
+		for {
+			select {
+			case env = <-p.sendCh:
+				if err := writeFrameTo(bw, enc, &encBuf, &frameBuf, env); err != nil {
+					t.closePeerConn(p, conn)
+					curConn = nil
+					break drain
+				}
+			default:
+				break drain
+			}
+		}
+
+		// Flush batch to network.
+		if curConn != nil {
+			if err := bw.Flush(); err != nil {
+				t.closePeerConn(p, conn)
+				curConn = nil
+			}
+		}
+	}
+}
+
+// closePeerConn closes a connection and clears it from the peer if it
+// hasn't been replaced in the meantime.
+func (t *Transport) closePeerConn(p *transportPeer, conn net.Conn) {
+	conn.Close()
+	p.mu.Lock()
+	if p.conn == conn {
+		p.conn = nil
+		p.enc = nil
+	}
+	p.mu.Unlock()
+}
+
 // --- read loop ---
 
 func (t *Transport) readLoop(remoteID string, conn net.Conn) {
@@ -301,8 +529,22 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 	var decBuf bytes.Buffer
 	dec := gob.NewDecoder(&decBuf)
 
+	// Buffered reader: one 64KB kernel read serves ~640 small frames,
+	// eliminating per-frame read syscalls. The raw conn is kept for
+	// SetReadDeadline calls.
+	bufReader := bufio.NewReaderSize(conn, 65536)
+
+	// Throttle read deadline updates: the 30s deadline only needs refreshing
+	// every ~10s. Uses the coarse clock (clock.go) for a zero-cost check.
+	var lastDeadlineSet int64
+
 	for {
-		env, err := decodeFrame(conn, dec, &decBuf)
+		now := coarseNow.Load()
+		if now-lastDeadlineSet >= 10 {
+			conn.SetReadDeadline(time.Now().Add(transportReadTimeout))
+			lastDeadlineSet = now
+		}
+		env, err := decodeFrame(bufReader, dec, &decBuf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -310,15 +552,14 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 			default:
 				slog.Warn("transport read error", "remote", remoteID, "error", err)
 				// Clear the connection so the next SendTo reconnects.
-				t.mu.Lock()
-				if p, ok := t.peers[remoteID]; ok {
+				if v, ok := t.peers.Load(remoteID); ok {
+					p := v.(*transportPeer)
 					p.mu.Lock()
 					if p.conn == conn {
 						p.conn = nil
 					}
 					p.mu.Unlock()
 				}
-				t.mu.Unlock()
 			}
 			return
 		}
@@ -331,18 +572,39 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 
 // --- framing ---
 
+// writeFrameTo encodes env into a single frame and writes it to w.
+// The caller provides the encoder, encode buffer, and frame buffer,
+// all of which are reused across calls for the same connection.
+func writeFrameTo(w io.Writer, enc *gob.Encoder, encBuf *bytes.Buffer, frameBuf *[]byte, env TransportEnvelope) error {
+	encBuf.Reset()
+	if err := enc.Encode(env.Payload); err != nil {
+		return fmt.Errorf("transport encode: %w", err)
+	}
+	gobBytes := encBuf.Bytes()
+
+	frameLen := 1 + len(gobBytes)
+	needed := 4 + frameLen
+	buf := *frameBuf
+	if cap(buf) < needed {
+		buf = make([]byte, needed)
+	} else {
+		buf = buf[:needed]
+	}
+	binary.BigEndian.PutUint32(buf[:4], uint32(frameLen))
+	buf[4] = env.Tag
+	copy(buf[5:], gobBytes)
+	*frameBuf = buf
+
+	_, err := w.Write(buf)
+	return err
+}
+
 // writeFrame encodes env into a single frame and writes it atomically
 // (single conn.Write) while holding the peer's write lock.
 //
-// The encoder is created lazily on first write and reused across messages.
-// Gob encoders cache type descriptions, so only the first message of a given
-// type includes the type preamble; subsequent messages are significantly
-// smaller and faster to encode. The encoder is reset when the connection
-// drops or is replaced (new connection = new gob stream).
-//
-// A write deadline of transportWriteTimeout is set before each write and
-// cleared on success. If the write times out or fails, the connection is
-// closed and cleared so the next SendTo will reconnect.
+// This method is retained for backward compatibility with tests and
+// benchmarks that create bare transportPeer structs. Production code
+// uses the peerWriter goroutine with writeFrameTo instead.
 func (t *Transport) writeFrame(p *transportPeer, env TransportEnvelope) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -351,40 +613,22 @@ func (t *Transport) writeFrame(p *transportPeer, env TransportEnvelope) error {
 		return fmt.Errorf("transport: peer %s not connected", p.hostID)
 	}
 
-	// Lazy-init encoder for this connection. The encoder caches type
-	// descriptions so subsequent messages of the same type are smaller.
+	conn := p.conn
+
 	if p.enc == nil {
 		p.encBuf.Reset()
 		p.enc = gob.NewEncoder(&p.encBuf)
 	}
 
-	// Encode payload, reusing the encoder's type cache.
-	p.encBuf.Reset()
-	if err := p.enc.Encode(env.Payload); err != nil {
-		return fmt.Errorf("transport encode: %w", err)
-	}
-	gobBytes := p.encBuf.Bytes()
-
-	// Build the complete frame: [4-byte length][1-byte tag][gob bytes]
-	frameLen := 1 + len(gobBytes)
-	needed := 4 + frameLen
-	if cap(p.frameBuf) < needed {
-		p.frameBuf = make([]byte, needed)
-	} else {
-		p.frameBuf = p.frameBuf[:needed]
-	}
-	binary.BigEndian.PutUint32(p.frameBuf[:4], uint32(frameLen))
-	p.frameBuf[4] = env.Tag
-	copy(p.frameBuf[5:], gobBytes)
-
-	p.conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
-	if _, err := p.conn.Write(p.frameBuf); err != nil {
-		p.conn.Close()
-		p.conn = nil
-		p.enc = nil
+	conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
+	if err := writeFrameTo(conn, p.enc, &p.encBuf, &p.frameBuf, env); err != nil {
+		conn.Close()
+		if p.conn == conn {
+			p.conn = nil
+			p.enc = nil
+		}
 		return fmt.Errorf("transport write: %w", err)
 	}
-	p.conn.SetWriteDeadline(time.Time{}) // clear deadline on success
 
 	return nil
 }
@@ -490,39 +734,66 @@ func decodeFrame(r io.Reader, dec *gob.Decoder, decBuf *bytes.Buffer) (Transport
 
 // --- handshake ---
 //
-// Handshake format: [2-byte big-endian hostID length][hostID UTF-8 bytes]
-// Max hostID length: 256 bytes.
+// Handshake format:
+//
+//	[2-byte big-endian hostID length][hostID UTF-8 bytes]
+//	[2-byte big-endian addr length][addr UTF-8 bytes]
+//
+// Max hostID length: 256 bytes. addr length 0 is valid (empty address).
+//
+// The addr field carries the sender's advertised listen address so the
+// receiver can store it for future outbound connections. Without this,
+// inbound connections would only know the ephemeral client port from
+// conn.RemoteAddr(), which is useless for dialing back.
 //
 // Direction symmetry:
-//   - Outbound (getOrConnect): write our hostID → read remote hostID
-//   - Inbound  (handleInbound): read remote hostID → write our hostID
+//   - Outbound (getOrConnect): write our hostID+addr → read remote hostID+addr
+//   - Inbound  (handleInbound): read remote hostID+addr → write our hostID+addr
 //
 // This asymmetry is intentional. The dialer writes first because it knows
 // who it expects to reach; the listener reads first to learn who connected.
-// On simultaneous connect both sides get an inbound connection that replaces
-// the outbound one (old conn closed, its readLoop exits on EOF).
+// On simultaneous connect, deterministic tie-breaking (higher hostID wins)
+// ensures exactly one connection survives per peer pair.
 
-func writeHandshake(w io.Writer, hostID string) error {
+func writeHandshake(w io.Writer, hostID, advertiseAddr string) error {
 	id := []byte(hostID)
-	buf := make([]byte, 2+len(id))
+	addr := []byte(advertiseAddr)
+	buf := make([]byte, 2+len(id)+2+len(addr))
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(id)))
 	copy(buf[2:], id)
+	off := 2 + len(id)
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(addr)))
+	copy(buf[off+2:], addr)
 	_, err := w.Write(buf)
 	return err
 }
 
-func readHandshake(r io.Reader) (string, error) {
+func readHandshake(r io.Reader) (hostID, advertiseAddr string, err error) {
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return "", fmt.Errorf("handshake read length: %w", err)
+		return "", "", fmt.Errorf("handshake read length: %w", err)
 	}
 	n := binary.BigEndian.Uint16(lenBuf[:])
 	if n == 0 || n > 256 {
-		return "", fmt.Errorf("handshake: invalid hostID length %d", n)
+		return "", "", fmt.Errorf("handshake: invalid hostID length %d", n)
 	}
 	id := make([]byte, n)
 	if _, err := io.ReadFull(r, id); err != nil {
-		return "", fmt.Errorf("handshake read hostID: %w", err)
+		return "", "", fmt.Errorf("handshake read hostID: %w", err)
 	}
-	return string(id), nil
+
+	// Read advertised address.
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return "", "", fmt.Errorf("handshake read addr length: %w", err)
+	}
+	addrLen := binary.BigEndian.Uint16(lenBuf[:])
+	var addr []byte
+	if addrLen > 0 {
+		addr = make([]byte, addrLen)
+		if _, err := io.ReadFull(r, addr); err != nil {
+			return "", "", fmt.Errorf("handshake read addr: %w", err)
+		}
+	}
+
+	return string(id), string(addr), nil
 }

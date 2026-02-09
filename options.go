@@ -27,6 +27,8 @@ type hostConfig struct {
 	actorInboxSize int  // per-actor inbox buffer (default 64)
 	hostInboxSize  int  // host inbox channel buffer (default 4096)
 	inboxWorkers   int  // number of processInbox goroutines (default GOMAXPROCS)
+	outboxWorkers  int  // number of processOutbox goroutines (default GOMAXPROCS)
+	outboxSize     int  // host outbox channel buffer (default 4096)
 	panicRecovery  bool // wrap receiver.Receive in defer/recover (default true)
 
 	// Admin server address (e.g. "127.0.0.1:9090"). Empty = disabled.
@@ -52,6 +54,8 @@ func defaultHostConfig() hostConfig {
 		actorInboxSize:     64,
 		hostInboxSize:      4096,
 		inboxWorkers:       runtime.GOMAXPROCS(0),
+		outboxWorkers:      runtime.GOMAXPROCS(0),
+		outboxSize:         4096,
 		panicRecovery:      true,
 	}
 }
@@ -146,6 +150,24 @@ func WithHostInboxSize(n int) Option {
 func WithInboxWorkers(n int) Option {
 	return func(c *hostConfig) {
 		c.inboxWorkers = n
+	}
+}
+
+// WithOutboxWorkers sets the number of goroutines consuming the host outbox.
+// More workers allow parallel message routing in cluster mode. All routing
+// functions are goroutine-safe (sharded locks, sync.Map, per-peer mutex).
+// Default: runtime.GOMAXPROCS(0).
+func WithOutboxWorkers(n int) Option {
+	return func(c *hostConfig) {
+		c.outboxWorkers = n
+	}
+}
+
+// WithOutboxSize sets the buffer size for the host's outbox channel.
+// Default: 4096.
+func WithOutboxSize(n int) Option {
+	return func(c *hostConfig) {
+		c.outboxSize = n
 	}
 }
 

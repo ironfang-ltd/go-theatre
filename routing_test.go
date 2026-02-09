@@ -74,7 +74,7 @@ func setupHostPair(t *testing.T) (hostA, hostB *Host, tA, tB *Transport, cleanup
 
 	hostA.transport = tA
 	hostA.cluster = &Cluster{config: ClusterConfig{HostID: "host-a"}, ring: ringAB}
-	hostA.placementCache = newPlacementCache(10 * time.Second)
+	hostA.placementCache = newPlacementCache(10)
 	hostA.cluster.mu.Lock()
 	hostA.cluster.epoch = 1
 	hostA.cluster.hosts = []HostInfo{
@@ -86,7 +86,7 @@ func setupHostPair(t *testing.T) (hostA, hostB *Host, tA, tB *Transport, cleanup
 
 	hostB.transport = tB
 	hostB.cluster = &Cluster{config: ClusterConfig{HostID: "host-b"}, ring: ringAB}
-	hostB.placementCache = newPlacementCache(10 * time.Second)
+	hostB.placementCache = newPlacementCache(10)
 	hostB.cluster.mu.Lock()
 	hostB.cluster.epoch = 1
 	hostB.cluster.hosts = []HostInfo{

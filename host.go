@@ -95,7 +95,7 @@ func NewHost(opts ...Option) *Host {
 				return &Response{}
 			},
 		},
-		outbox:        make(chan OutboxMessage, 512),
+		outbox:        make(chan OutboxMessage, cfg.outboxSize),
 		inbox:         make(chan InboxMessage, cfg.hostInboxSize),
 		done:          make(chan struct{}),
 		pendingRemote: make(map[int64]*pendingRemoteRequest),
@@ -118,7 +118,9 @@ func (m *Host) Start() {
 
 	// In standalone mode, messages bypass the outbox entirely.
 	if m.cluster != nil {
-		go m.processOutbox()
+		for range m.config.outboxWorkers {
+			go m.processOutbox()
+		}
 	}
 
 	for range m.config.inboxWorkers {
