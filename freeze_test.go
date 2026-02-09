@@ -470,8 +470,8 @@ func TestFreeze_RegistryForceDeregisterAll(t *testing.T) {
 	am := NewActorManager()
 
 	// Create a few actors manually (no goroutines needed for this test).
-	a1 := &Actor{ref: NewRef("test", "1"), inbox: make(chan InboxMessage), shutdown: make(chan bool, 1)}
-	a2 := &Actor{ref: NewRef("test", "2"), inbox: make(chan InboxMessage), shutdown: make(chan bool, 1)}
+	a1 := &Actor{ref: NewRef("test", "1"), inbox: make(chan InboxMessage, 1), shutdown: make(chan bool, 1)}
+	a2 := &Actor{ref: NewRef("test", "2"), inbox: make(chan InboxMessage, 1), shutdown: make(chan bool, 1)}
 	am.Register(a1)
 	am.Register(a2)
 

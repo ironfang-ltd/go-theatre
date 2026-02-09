@@ -40,13 +40,13 @@ type Actor struct {
 	actorCancel context.CancelFunc
 }
 
-func NewActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context) *Actor {
+func NewActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context, inboxSize int) *Actor {
 	actorCtx, actorCancel := context.WithCancel(parentCtx)
 	return &Actor{
 		host:        host,
 		ref:         ref,
 		receiver:    receiver,
-		inbox:       make(chan InboxMessage),
+		inbox:       make(chan InboxMessage, inboxSize),
 		shutdown:    make(chan bool, 1),
 		actorCtx:    actorCtx,
 		actorCancel: actorCancel,

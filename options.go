@@ -2,6 +2,7 @@ package theatre
 
 import (
 	"log/slog"
+	"runtime"
 	"time"
 )
 
@@ -21,6 +22,11 @@ type hostConfig struct {
 	freezeGracePeriod  time.Duration // time to wait for actors to exit after ctx cancel
 	safetyMargin       time.Duration // trigger freeze when remaining lease < this
 	maxRenewalFailures int           // trigger freeze after N consecutive renewal failures
+
+	// Throughput tuning.
+	actorInboxSize int // per-actor inbox buffer (default 64)
+	hostInboxSize  int // host inbox channel buffer (default 4096)
+	inboxWorkers   int // number of processInbox goroutines (default GOMAXPROCS)
 
 	// Admin server address (e.g. "127.0.0.1:9090"). Empty = disabled.
 	adminAddr string
@@ -42,6 +48,9 @@ func defaultHostConfig() hostConfig {
 		freezeGracePeriod:  2 * time.Second,
 		safetyMargin:       3 * time.Second,
 		maxRenewalFailures: 2,
+		actorInboxSize:     64,
+		hostInboxSize:      4096,
+		inboxWorkers:       runtime.GOMAXPROCS(0),
 	}
 }
 
@@ -108,6 +117,33 @@ func WithAdminAddr(addr string) Option {
 func WithLogLevel(level slog.Level) Option {
 	return func(c *hostConfig) {
 		c.logLevel = level
+	}
+}
+
+// WithActorInboxSize sets the buffer size for each actor's inbox channel.
+// A larger buffer allows processInbox to deliver messages without blocking
+// when the actor is busy. Default: 64.
+func WithActorInboxSize(n int) Option {
+	return func(c *hostConfig) {
+		c.actorInboxSize = n
+	}
+}
+
+// WithHostInboxSize sets the buffer size for the host's central inbox channel.
+// Default: 4096.
+func WithHostInboxSize(n int) Option {
+	return func(c *hostConfig) {
+		c.hostInboxSize = n
+	}
+}
+
+// WithInboxWorkers sets the number of goroutines consuming the host inbox.
+// More workers allow parallel message dispatch at the cost of relaxed
+// cross-actor message ordering (per-actor ordering is always preserved).
+// Default: runtime.GOMAXPROCS(0).
+func WithInboxWorkers(n int) Option {
+	return func(c *hostConfig) {
+		c.inboxWorkers = n
 	}
 }
 

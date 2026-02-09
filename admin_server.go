@@ -281,11 +281,10 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 
 // registeredTypes returns the names of all registered actor types.
 func (m *Host) registeredTypes() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	types := make([]string, 0, len(m.descriptors))
-	for name := range m.descriptors {
-		types = append(types, name)
-	}
+	var types []string
+	m.descriptors.Range(func(key, _ any) bool {
+		types = append(types, key.(string))
+		return true
+	})
 	return types
 }

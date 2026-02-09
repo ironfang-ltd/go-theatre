@@ -30,12 +30,11 @@ type Response struct {
 type Host struct {
 	hostRef     HostRef
 	config      hostConfig
-	descriptors map[string]*Descriptor
+	descriptors sync.Map // map[string]*Descriptor
 	actors      *ActorRegistry
 	requests    *RequestManager
 	directory   Directory
 
-	mu      sync.RWMutex
 	resPool sync.Pool
 	outbox  chan OutboxMessage
 	inbox   chan InboxMessage
@@ -86,11 +85,9 @@ func NewHost(opts ...Option) *Host {
 	metrics := newMetrics()
 
 	h := &Host{
-		hostRef:      hostRef,
-		config:       cfg,
-		mu:           sync.RWMutex{},
-		descriptors:  make(map[string]*Descriptor),
-		requests:     NewRequestManager(),
+		hostRef:  hostRef,
+		config:   cfg,
+		requests: NewRequestManager(),
 		directory:    NewDirectory(),
 		actors:       NewActorManager(),
 		resPool: sync.Pool{
@@ -99,7 +96,7 @@ func NewHost(opts ...Option) *Host {
 			},
 		},
 		outbox:        make(chan OutboxMessage, 512),
-		inbox:         make(chan InboxMessage, 512),
+		inbox:         make(chan InboxMessage, cfg.hostInboxSize),
 		drain:         make(chan struct{}),
 		done:          make(chan struct{}),
 		pendingRemote: make(map[int64]*pendingRemoteRequest),
@@ -118,8 +115,15 @@ func (m *Host) Start() {
 	slog.Info("starting", "host", m.hostRef.String())
 
 	go m.cleanup()
-	go m.processOutbox()
-	go m.processInbox()
+
+	// In standalone mode, messages bypass the outbox entirely.
+	if m.cluster != nil {
+		go m.processOutbox()
+	}
+
+	for range m.config.inboxWorkers {
+		go m.processInbox()
+	}
 
 	// Start freeze monitor in cluster mode.
 	if m.cluster != nil {
@@ -169,6 +173,39 @@ func (m *Host) Metrics() *Metrics {
 }
 
 func (m *Host) sendInternal(msg OutboxMessage) {
+	if m.cluster == nil {
+		// Standalone reply: resolve directly to the waiting request,
+		// bypassing both outbox and inbox channels.
+		if msg.IsReply {
+			req := m.requests.Get(msg.ReplyID)
+			if req != nil {
+				res := m.resPool.Get().(*Response)
+				res.Body = msg.Body
+				res.Error = msg.Error
+				req.Response <- res
+			}
+			return
+		}
+
+		// Standalone non-reply (actor-to-actor send): deliver directly
+		// to existing actor or fall back to inbox for actor creation.
+		if a := m.actors.Lookup(msg.RecipientRef); a != nil {
+			a.Send(InboxMessage{
+				SenderHostRef: m.hostRef,
+				RecipientRef:  msg.RecipientRef,
+				Body:          msg.Body,
+				ReplyID:       msg.ReplyID,
+			})
+			return
+		}
+		m.inbox <- InboxMessage{
+			SenderHostRef: m.hostRef,
+			RecipientRef:  msg.RecipientRef,
+			Body:          msg.Body,
+			ReplyID:       msg.ReplyID,
+		}
+		return
+	}
 	m.outbox <- msg
 }
 
@@ -191,21 +228,23 @@ func (m *Host) waitForDrain() {
 }
 
 func (m *Host) RegisterActor(name string, creator Creator) {
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.descriptors[name] = &Descriptor{
+	m.descriptors.Store(name, &Descriptor{
 		Name:   name,
 		Create: creator,
-	}
+	})
 }
 
 func (m *Host) hasDescriptor(typeName string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	_, ok := m.descriptors[typeName]
+	_, ok := m.descriptors.Load(typeName)
 	return ok
+}
+
+func (m *Host) getDescriptor(typeName string) *Descriptor {
+	v, ok := m.descriptors.Load(typeName)
+	if !ok {
+		return nil
+	}
+	return v.(*Descriptor)
 }
 
 func (m *Host) Send(ref Ref, body interface{}) error {
@@ -220,19 +259,36 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 		return ErrHostFrozen
 	}
 
-	// In standalone mode, require a local descriptor.
-	// In cluster mode, the actor type may live on another host.
-	if m.cluster == nil {
-		if !m.hasDescriptor(ref.Type) {
-			return ErrUnregisteredActorType
+	if m.cluster != nil {
+		// Cluster mode: route through outbox.
+		m.outbox <- OutboxMessage{
+			RecipientRef: ref,
+			Body:         body,
 		}
+		m.metrics.MessagesSent.Add(1)
+		return nil
 	}
 
-	m.outbox <- OutboxMessage{
-		RecipientRef: ref,
-		Body:         body,
+	// Standalone mode.
+	if !m.hasDescriptor(ref.Type) {
+		return ErrUnregisteredActorType
 	}
 
+	msg := InboxMessage{
+		SenderHostRef: m.hostRef,
+		RecipientRef:  ref,
+		Body:          body,
+	}
+
+	// Fast path: deliver directly to existing actor, skip inbox channel.
+	if a := m.actors.Lookup(ref); a != nil {
+		a.Send(msg)
+		m.metrics.MessagesSent.Add(1)
+		return nil
+	}
+
+	// Slow path: actor doesn't exist yet, route through inbox for creation.
+	m.inbox <- msg
 	m.metrics.MessagesSent.Add(1)
 	return nil
 }
@@ -249,10 +305,8 @@ func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
 		return nil, ErrHostFrozen
 	}
 
-	if m.cluster == nil {
-		if !m.hasDescriptor(ref.Type) {
-			return nil, ErrUnregisteredActorType
-		}
+	if m.cluster == nil && !m.hasDescriptor(ref.Type) {
+		return nil, ErrUnregisteredActorType
 	}
 
 	m.metrics.RequestsTotal.Add(1)
@@ -264,11 +318,27 @@ func (m *Host) requestInternal(ref Ref, body interface{}) (interface{}, error) {
 	// create a new request to track the response
 	req := m.requests.Create(ref)
 
-	// send the request to the actor
-	m.outbox <- OutboxMessage{
-		RecipientRef: ref,
-		Body:         body,
-		ReplyID:      req.ID,
+	msg := InboxMessage{
+		SenderHostRef: m.hostRef,
+		RecipientRef:  ref,
+		Body:          body,
+		ReplyID:       req.ID,
+	}
+
+	if m.cluster == nil {
+		// Fast path: deliver directly to existing actor, skip inbox channel.
+		if a := m.actors.Lookup(ref); a != nil {
+			a.Send(msg)
+		} else {
+			// Slow path: actor doesn't exist yet, route through inbox.
+			m.inbox <- msg
+		}
+	} else {
+		m.outbox <- OutboxMessage{
+			RecipientRef: ref,
+			Body:         body,
+			ReplyID:      req.ID,
+		}
 	}
 
 	defer (func() {
@@ -329,8 +399,9 @@ func (m *Host) processInbox() {
 					continue
 				}
 
-				// Standalone mode: if the actor is not found, create it
-				a = m.createLocalActor(msg.RecipientRef, ActivationNew)
+				// Standalone mode: use activation gate for thread-safe
+				// creation when multiple inbox workers are running.
+				a = m.standaloneActivate(msg.RecipientRef)
 				if a == nil {
 					slog.Error("failed to create actor", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
 					if m.config.deadLetterHandler != nil {
@@ -372,11 +443,8 @@ func (m *Host) processOutbox() {
 
 func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	d, ok := m.descriptors[ref.Type]
-	if !ok {
+	d := m.getDescriptor(ref.Type)
+	if d == nil {
 		return nil
 	}
 
@@ -387,7 +455,7 @@ func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 
 	receiver := d.Create()
 
-	a := NewActor(m, ref, receiver, parentCtx)
+	a := NewActor(m, ref, receiver, parentCtx, m.config.actorInboxSize)
 	a.onStop = func(r Ref) {
 		m.actors.DeregisterOnly(r)
 	}
@@ -404,6 +472,33 @@ func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 
 	m.actors.Register(a)
 
+	return a
+}
+
+// standaloneActivate creates an actor using the activation gate to
+// deduplicate concurrent creation attempts from multiple inbox workers.
+func (m *Host) standaloneActivate(ref Ref) *Actor {
+	gate := &activationGate{done: make(chan struct{})}
+	if existing, loaded := m.activating.LoadOrStore(ref, gate); loaded {
+		// Another worker is already creating this actor. Wait for it.
+		existingGate := existing.(*activationGate)
+		<-existingGate.done
+		return existingGate.actor
+	}
+
+	defer func() {
+		close(gate.done)
+		m.activating.Delete(ref)
+	}()
+
+	// Double-check: actor may have been registered while we waited.
+	if a := m.actors.Lookup(ref); a != nil {
+		gate.actor = a
+		return a
+	}
+
+	a := m.createLocalActor(ref, ActivationNew)
+	gate.actor = a
 	return a
 }
 
