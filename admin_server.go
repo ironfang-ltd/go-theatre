@@ -95,10 +95,9 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 	if h.cluster == nil {
 		state = "standalone"
 	} else if h.frozen.Load() {
-		select {
-		case <-h.drain:
+		if h.draining.Load() {
 			state = "draining"
-		default:
+		} else {
 			state = "frozen"
 		}
 	}

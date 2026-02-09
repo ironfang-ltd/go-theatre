@@ -7,93 +7,78 @@ import (
 )
 
 type ActorRegistry struct {
-	actors map[Ref]*Actor
-	mu     sync.RWMutex
+	actors sync.Map // map[Ref]*Actor
 }
 
 func NewActorManager() *ActorRegistry {
-	return &ActorRegistry{
-		actors: make(map[Ref]*Actor),
-	}
+	return &ActorRegistry{}
 }
 
 func (am *ActorRegistry) Register(a *Actor) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	am.actors[a.ref] = a
+	am.actors.Store(a.ref, a)
 }
 
 func (am *ActorRegistry) Lookup(ref Ref) *Actor {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
-
-	return am.actors[ref]
+	v, ok := am.actors.Load(ref)
+	if !ok {
+		return nil
+	}
+	return v.(*Actor)
 }
 
 func (am *ActorRegistry) Remove(ref Ref) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	a := am.actors[ref]
-	if a == nil {
+	v, loaded := am.actors.LoadAndDelete(ref)
+	if !loaded {
 		return
 	}
-
-	delete(am.actors, ref)
-
-	a.Shutdown()
+	v.(*Actor).Shutdown()
 }
 
 func (am *ActorRegistry) DeregisterOnly(ref Ref) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	delete(am.actors, ref)
+	am.actors.Delete(ref)
 }
 
 func (am *ActorRegistry) RemoveIdle(idleTimeout time.Duration) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	for ref, a := range am.actors {
+	am.actors.Range(func(key, value any) bool {
+		ref := key.(Ref)
+		a := value.(*Actor)
 		if time.Since(a.GetLastMessageTime()) > idleTimeout {
 			slog.Info("actor idle, shutting down", "type", ref.Type, "id", ref.ID)
-			delete(am.actors, ref)
+			am.actors.Delete(ref)
 			a.Shutdown()
 		}
-	}
+		return true
+	})
 }
 
 func (am *ActorRegistry) RemoveAll() {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	for ref, a := range am.actors {
+	am.actors.Range(func(key, value any) bool {
+		a := value.(*Actor)
 		a.Shutdown()
-		delete(am.actors, ref)
-	}
+		am.actors.Delete(key)
+		return true
+	})
 }
 
 // ForceDeregisterAll removes all actors from the registry without sending
 // Shutdown. Returns the refs of all removed actors so the caller can
 // release ownership for each.
 func (am *ActorRegistry) ForceDeregisterAll() []Ref {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
-	refs := make([]Ref, 0, len(am.actors))
-	for ref := range am.actors {
-		refs = append(refs, ref)
-	}
-	// Clear the map.
-	am.actors = make(map[Ref]*Actor)
+	var refs []Ref
+	am.actors.Range(func(key, value any) bool {
+		refs = append(refs, key.(Ref))
+		am.actors.Delete(key)
+		return true
+	})
 	return refs
 }
 
 // Count returns the number of registered actors.
 func (am *ActorRegistry) Count() int {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
-	return len(am.actors)
+	count := 0
+	am.actors.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }

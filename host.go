@@ -35,11 +35,11 @@ type Host struct {
 	requests    *RequestManager
 	directory   Directory
 
-	resPool sync.Pool
-	outbox  chan OutboxMessage
-	inbox   chan InboxMessage
-	drain   chan struct{}
-	done    chan struct{}
+	resPool  sync.Pool
+	outbox   chan OutboxMessage
+	inbox    chan InboxMessage
+	draining atomic.Bool
+	done     chan struct{}
 
 	// Cluster routing (nil in standalone mode).
 	transport      *Transport
@@ -97,7 +97,6 @@ func NewHost(opts ...Option) *Host {
 		},
 		outbox:        make(chan OutboxMessage, 512),
 		inbox:         make(chan InboxMessage, cfg.hostInboxSize),
-		drain:         make(chan struct{}),
 		done:          make(chan struct{}),
 		pendingRemote: make(map[int64]*pendingRemoteRequest),
 		freezeCtx:    freezeCtx,
@@ -150,8 +149,8 @@ func (m *Host) Stop() {
 			m.adminServer.Stop()
 		}
 
-		// phase 1: close drain to reject new external messages
-		close(m.drain)
+		// phase 1: set draining flag to reject new external messages
+		m.draining.Store(true)
 
 		// wait for in-flight messages to be processed or timeout
 		m.waitForDrain()
@@ -249,10 +248,8 @@ func (m *Host) getDescriptor(typeName string) *Descriptor {
 
 func (m *Host) Send(ref Ref, body interface{}) error {
 
-	select {
-	case <-m.drain:
+	if m.draining.Load() {
 		return ErrHostDraining
-	default:
 	}
 
 	if m.frozen.Load() {
@@ -295,10 +292,8 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 
 func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
 
-	select {
-	case <-m.drain:
+	if m.draining.Load() {
 		return nil, ErrHostDraining
-	default:
 	}
 
 	if m.frozen.Load() {

@@ -207,10 +207,7 @@ func TestStop(t *testing.T) {
 
 	host.Stop()
 
-	host.actors.mu.RLock()
-	defer host.actors.mu.RUnlock()
-
-	if len(host.actors.actors) != 0 {
+	if host.actors.Count() != 0 {
 		t.Fatal("actors not removed")
 	}
 }
@@ -345,9 +342,7 @@ func TestRequest_UnregisteredActor(t *testing.T) {
 	req := host.requests.Create(ref)
 
 	// simulate immediate expiry
-	host.requests.mu.Lock()
 	req.SentAt = req.SentAt.Add(-10 * time.Second)
-	host.requests.mu.Unlock()
 
 	host.requests.RemoveExpired(5 * time.Second)
 
@@ -650,10 +645,7 @@ func TestGracefulDrain(t *testing.T) {
 	// stop should complete gracefully
 	host.Stop()
 
-	host.actors.mu.RLock()
-	defer host.actors.mu.RUnlock()
-
-	if len(host.actors.actors) != 0 {
+	if host.actors.Count() != 0 {
 		t.Fatal("actors not removed after graceful drain")
 	}
 }

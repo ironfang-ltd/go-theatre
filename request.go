@@ -23,15 +23,13 @@ func (r *Request) Timeout() {
 }
 
 type RequestManager struct {
-	requests map[int64]*Request
-	mu       sync.Mutex
+	requests sync.Map // map[int64]*Request
 	reqPool  sync.Pool
 	reqID    int64
 }
 
 func NewRequestManager() *RequestManager {
 	return &RequestManager{
-		requests: make(map[int64]*Request),
 		reqPool: sync.Pool{
 			New: func() interface{} {
 				return &Request{
@@ -57,59 +55,48 @@ func (rm *RequestManager) Create(ref Ref) *Request {
 	r.To = ref
 	r.SentAt = time.Now()
 
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	rm.requests[r.ID] = r
+	rm.requests.Store(r.ID, r)
 
 	return r
 }
 
 func (rm *RequestManager) Get(id int64) *Request {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	return rm.requests[id]
+	v, ok := rm.requests.Load(id)
+	if !ok {
+		return nil
+	}
+	return v.(*Request)
 }
 
 func (rm *RequestManager) Remove(id int64) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	req := rm.requests[id]
-
-	if req == nil {
+	v, loaded := rm.requests.LoadAndDelete(id)
+	if !loaded {
 		return
 	}
-
-	delete(rm.requests, id)
-
-	rm.reqPool.Put(req)
+	rm.reqPool.Put(v)
 }
 
 func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
 	expired := 0
-	for _, req := range rm.requests {
+	rm.requests.Range(func(key, value any) bool {
+		req := value.(*Request)
 		if time.Since(req.SentAt) > requestTimeout {
-			delete(rm.requests, req.ID)
+			rm.requests.Delete(key)
 			req.Timeout()
 			expired++
 		}
-	}
+		return true
+	})
 	return expired
 }
 
 // FailAll sends an error response to all pending requests and removes
 // them from the manager. Used during freeze to unblock waiting callers.
 func (rm *RequestManager) FailAll(err error) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	for id, req := range rm.requests {
+	rm.requests.Range(func(key, value any) bool {
+		req := value.(*Request)
 		req.Response <- &Response{Error: err}
-		delete(rm.requests, id)
-	}
+		rm.requests.Delete(key)
+		return true
+	})
 }
