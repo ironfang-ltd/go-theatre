@@ -87,14 +87,29 @@ func (rm *RequestManager) Remove(id int64) {
 	rm.reqPool.Put(req)
 }
 
-func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) {
+func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
+	expired := 0
 	for _, req := range rm.requests {
 		if time.Since(req.SentAt) > requestTimeout {
 			delete(rm.requests, req.ID)
 			req.Timeout()
+			expired++
 		}
+	}
+	return expired
+}
+
+// FailAll sends an error response to all pending requests and removes
+// them from the manager. Used during freeze to unblock waiting callers.
+func (rm *RequestManager) FailAll(err error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	for id, req := range rm.requests {
+		req.Response <- &Response{Error: err}
+		delete(rm.requests, id)
 	}
 }

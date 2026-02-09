@@ -1,0 +1,18 @@
+name: theatre
+
+services:
+  postgres:
+    image: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: theatre
+      POSTGRES_PASSWORD: theatre
+      POSTGRES_DB: theatre
+    ports:
+      - "8432:5432"
+    networks:
+      theatre: 
+
+networks:
+  theatre:
+    driver: bridge

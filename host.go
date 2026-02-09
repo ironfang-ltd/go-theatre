@@ -1,15 +1,18 @@
 package theatre
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var (
 	ErrUnregisteredActorType = fmt.Errorf("unregistered actor type")
 	ErrHostDraining          = fmt.Errorf("host is draining")
+	ErrHostFrozen            = fmt.Errorf("host is frozen")
 )
 
 type Creator func() Receiver
@@ -38,6 +41,32 @@ type Host struct {
 	inbox   chan InboxMessage
 	drain   chan struct{}
 	done    chan struct{}
+
+	// Cluster routing (nil in standalone mode).
+	transport      *Transport
+	cluster        *Cluster
+	placementCache *PlacementCache
+
+	// Pending remote requests awaiting reply or NotHere.
+	pendingRemoteMu sync.Mutex
+	pendingRemote   map[int64]*pendingRemoteRequest
+
+	// Activation gate: deduplicates concurrent activations for the same Ref.
+	activating sync.Map // map[Ref]*activationGate
+
+	// Observability.
+	metrics     *Metrics
+	adminServer *AdminServer
+
+	// Freeze state. Protected by freezeMu for ctx/cancel pair;
+	// the frozen flag itself is atomic for lock-free fast-path checks.
+	frozen      atomic.Bool
+	freezeMu    sync.Mutex
+	freezeCtx   context.Context
+	freezeCancel context.CancelFunc
+
+	// Stop idempotency.
+	stopOnce sync.Once
 }
 
 func NewHost(opts ...Option) *Host {
@@ -52,24 +81,36 @@ func NewHost(opts ...Option) *Host {
 		panic(err)
 	}
 
-	return &Host{
-		hostRef:     hostRef,
-		config:      cfg,
-		mu:          sync.RWMutex{},
-		descriptors: make(map[string]*Descriptor),
-		requests:    NewRequestManager(),
-		directory:   NewDirectory(),
-		actors:      NewActorManager(),
+	freezeCtx, freezeCancel := context.WithCancel(context.Background())
+
+	metrics := newMetrics()
+
+	h := &Host{
+		hostRef:      hostRef,
+		config:       cfg,
+		mu:           sync.RWMutex{},
+		descriptors:  make(map[string]*Descriptor),
+		requests:     NewRequestManager(),
+		directory:    NewDirectory(),
+		actors:       NewActorManager(),
 		resPool: sync.Pool{
 			New: func() interface{} {
 				return &Response{}
 			},
 		},
-		outbox: make(chan OutboxMessage, 512),
-		inbox:  make(chan InboxMessage, 512),
-		drain:  make(chan struct{}),
-		done:   make(chan struct{}),
+		outbox:        make(chan OutboxMessage, 512),
+		inbox:         make(chan InboxMessage, 512),
+		drain:         make(chan struct{}),
+		done:          make(chan struct{}),
+		pendingRemote: make(map[int64]*pendingRemoteRequest),
+		freezeCtx:    freezeCtx,
+		freezeCancel: freezeCancel,
+		metrics:      metrics,
 	}
+
+	metrics.actorCountFn = h.actors.Count
+
+	return h
 }
 
 func (m *Host) Start() {
@@ -79,21 +120,52 @@ func (m *Host) Start() {
 	go m.cleanup()
 	go m.processOutbox()
 	go m.processInbox()
+
+	// Start freeze monitor in cluster mode.
+	if m.cluster != nil {
+		go m.freezeMonitor()
+	}
+
+	// Start admin server if configured.
+	if m.config.adminAddr != "" {
+		as, err := NewAdminServer(m, m.config.adminAddr)
+		if err != nil {
+			slog.Error("admin server failed to start", "error", err)
+		} else {
+			m.adminServer = as
+			as.Start()
+		}
+	}
 }
 
 func (m *Host) Stop() {
+	m.stopOnce.Do(func() {
+		slog.Info("stopping", "host", m.hostRef.String())
 
-	slog.Info("stopping", "host", m.hostRef.String())
+		if m.adminServer != nil {
+			m.adminServer.Stop()
+		}
 
-	// phase 1: close drain to reject new external messages
-	close(m.drain)
+		// phase 1: close drain to reject new external messages
+		close(m.drain)
 
-	// wait for in-flight messages to be processed or timeout
-	m.waitForDrain()
+		// wait for in-flight messages to be processed or timeout
+		m.waitForDrain()
 
-	// phase 2: close done to stop processing goroutines
-	close(m.done)
-	m.actors.RemoveAll()
+		// phase 2: close done to stop processing goroutines
+		close(m.done)
+		m.actors.RemoveAll()
+	})
+}
+
+// IsFrozen returns whether the host is currently frozen.
+func (m *Host) IsFrozen() bool {
+	return m.frozen.Load()
+}
+
+// Metrics returns the host's operational metrics.
+func (m *Host) Metrics() *Metrics {
+	return m.metrics
 }
 
 func (m *Host) sendInternal(msg OutboxMessage) {
@@ -144,8 +216,16 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 	default:
 	}
 
-	if !m.hasDescriptor(ref.Type) {
-		return ErrUnregisteredActorType
+	if m.frozen.Load() {
+		return ErrHostFrozen
+	}
+
+	// In standalone mode, require a local descriptor.
+	// In cluster mode, the actor type may live on another host.
+	if m.cluster == nil {
+		if !m.hasDescriptor(ref.Type) {
+			return ErrUnregisteredActorType
+		}
 	}
 
 	m.outbox <- OutboxMessage{
@@ -153,6 +233,7 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 		Body:         body,
 	}
 
+	m.metrics.MessagesSent.Add(1)
 	return nil
 }
 
@@ -164,10 +245,17 @@ func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
 	default:
 	}
 
-	if !m.hasDescriptor(ref.Type) {
-		return nil, ErrUnregisteredActorType
+	if m.frozen.Load() {
+		return nil, ErrHostFrozen
 	}
 
+	if m.cluster == nil {
+		if !m.hasDescriptor(ref.Type) {
+			return nil, ErrUnregisteredActorType
+		}
+	}
+
+	m.metrics.RequestsTotal.Add(1)
 	return m.requestInternal(ref, body)
 }
 
@@ -203,6 +291,7 @@ func (m *Host) processInbox() {
 		case <-m.done:
 			return
 		case msg := <-m.inbox:
+			m.metrics.MessagesReceived.Add(1)
 
 			if msg.IsReply {
 
@@ -216,12 +305,32 @@ func (m *Host) processInbox() {
 				continue
 			}
 
+			// When frozen, only deliver replies. Drop everything else.
+			if m.frozen.Load() {
+				m.metrics.MessagesDeadLettered.Add(1)
+				if m.config.deadLetterHandler != nil {
+					m.config.deadLetterHandler(msg)
+				}
+				continue
+			}
+
 			// try to find the actor in the local registry
 			a := m.actors.Lookup(msg.RecipientRef)
 			if a == nil {
 
-				// if the actor is not found, create it
-				a = m.createLocalActor(msg.RecipientRef)
+				// In cluster mode, don't auto-create. The actor should
+				// have been verified by routeMessage or spawned explicitly.
+				if m.cluster != nil {
+					slog.Warn("actor not found in cluster mode",
+						"type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
+					if m.config.deadLetterHandler != nil {
+						m.config.deadLetterHandler(msg)
+					}
+					continue
+				}
+
+				// Standalone mode: if the actor is not found, create it
+				a = m.createLocalActor(msg.RecipientRef, ActivationNew)
 				if a == nil {
 					slog.Error("failed to create actor", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
 					if m.config.deadLetterHandler != nil {
@@ -237,40 +346,31 @@ func (m *Host) processInbox() {
 }
 
 func (m *Host) processOutbox() {
-
-	// process messages in the outbox queue
-	// and forward them to the appropriate actor
-
 	for {
 		select {
 		case <-m.done:
 			return
 		case msg := <-m.outbox:
-
-			// check the directory to see if the actor is registered
-			/*hostRef, ok := m.directory.Lookup(msg.To)
-			if ok {
-				if hostRef != m.hostRef {
-					// forward the message to the remote host
-					slog.Info("forwarding message to remote host", "type", msg.To.Type, "id", msg.To.ID, "host", hostRef.String())
-					continue
+			// When frozen, still drain replies but drop non-reply messages.
+			if m.frozen.Load() && !msg.IsReply {
+				if msg.ReplyID != 0 {
+					m.failPendingRequest(msg.ReplyID, ErrHostFrozen)
 				}
-			}*/
+				continue
+			}
 
-			// route all messages to the local actor manager
-			m.inbox <- InboxMessage{
-				SenderHostRef: m.hostRef,
-				RecipientRef:  msg.RecipientRef,
-				Body:          msg.Body,
-				ReplyID:       msg.ReplyID,
-				IsReply:       msg.IsReply,
-				Error:         msg.Error,
+			if msg.IsReply {
+				m.routeReply(msg)
+			} else if m.cluster != nil {
+				m.routeMessage(msg)
+			} else {
+				m.deliverLocal(msg)
 			}
 		}
 	}
 }
 
-func (m *Host) createLocalActor(ref Ref) *Actor {
+func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -280,19 +380,27 @@ func (m *Host) createLocalActor(ref Ref) *Actor {
 		return nil
 	}
 
+	// Read the current freeze context under lock.
+	m.freezeMu.Lock()
+	parentCtx := m.freezeCtx
+	m.freezeMu.Unlock()
+
 	receiver := d.Create()
 
-	a := NewActor(m, ref, receiver)
+	a := NewActor(m, ref, receiver, parentCtx)
 	a.onStop = func(r Ref) {
 		m.actors.DeregisterOnly(r)
 	}
+	a.onDeactivate = func(r Ref) {
+		m.releaseOwnership(r)
+	}
 	go a.Receive()
 
-	a.inbox <- InboxMessage{
+	a.Send(InboxMessage{
 		SenderHostRef: m.hostRef,
 		RecipientRef:  ref,
-		Body:          Initialize{},
-	}
+		Body:          Initialize{Reason: reason},
+	})
 
 	m.actors.Register(a)
 
@@ -310,7 +418,10 @@ func (m *Host) cleanup() {
 			return
 		case <-ticker.C:
 			m.actors.RemoveIdle(m.config.idleTimeout)
-			m.requests.RemoveExpired(m.config.requestTimeout)
+			expired := m.requests.RemoveExpired(m.config.requestTimeout)
+			if expired > 0 {
+				m.metrics.RequestsTimedOut.Add(int64(expired))
+			}
 		}
 	}
 }

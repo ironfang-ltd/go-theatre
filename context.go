@@ -1,5 +1,7 @@
 package theatre
 
+import "context"
+
 type Context struct {
 	// The ID of the current actor
 	ActorRef Ref
@@ -10,8 +12,17 @@ type Context struct {
 	// The message being processed
 	Message interface{}
 
+	// Ctx is the actor's context, derived from the host's freeze context.
+	// Receivers can check Ctx.Done() to detect freeze cancellation during
+	// long-running operations.
+	Ctx context.Context
+
 	host    *Host
 	replyId int64
+
+	// Remote routing: set when message came from a remote host.
+	senderHostID  string
+	senderAddress string
 }
 
 func (c *Context) Send(ref Ref, body interface{}) error {
@@ -35,6 +46,8 @@ func (c *Context) Reply(body interface{}) error {
 		ReplyID:          c.replyId,
 		Body:             body,
 		Error:            nil,
+		recipientHostID:  c.senderHostID,
+		recipientAddress: c.senderAddress,
 	})
 
 	return nil

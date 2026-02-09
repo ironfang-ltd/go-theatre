@@ -1,6 +1,7 @@
 package theatre
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,23 +24,32 @@ const (
 )
 
 type Actor struct {
-	host        *Host
-	ref         Ref
-	receiver    Receiver
-	inbox       chan InboxMessage
-	shutdown    chan bool
-	lastMessage int64
-	status      int64
-	onStop      func(Ref)
+	host         *Host
+	ref          Ref
+	receiver     Receiver
+	inbox        chan InboxMessage
+	shutdown     chan bool
+	lastMessage  int64
+	status       int64
+	onStop       func(Ref)
+	onDeactivate func(Ref)
+
+	// Context derived from the host's freezeCtx. Cancelled when the host
+	// enters frozen state so the actor can exit cleanly.
+	actorCtx    context.Context
+	actorCancel context.CancelFunc
 }
 
-func NewActor(host *Host, ref Ref, receiver Receiver) *Actor {
+func NewActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context) *Actor {
+	actorCtx, actorCancel := context.WithCancel(parentCtx)
 	return &Actor{
-		host:     host,
-		ref:      ref,
-		receiver: receiver,
-		inbox:    make(chan InboxMessage),
-		shutdown: make(chan bool, 1),
+		host:        host,
+		ref:         ref,
+		receiver:    receiver,
+		inbox:       make(chan InboxMessage),
+		shutdown:    make(chan bool, 1),
+		actorCtx:    actorCtx,
+		actorCancel: actorCancel,
 	}
 }
 
@@ -54,7 +64,11 @@ func (a *Actor) Send(msg InboxMessage) {
 		return
 	}
 
-	a.inbox <- msg
+	select {
+	case a.inbox <- msg:
+	case <-a.actorCtx.Done():
+		// Actor is being cancelled (host freeze). Don't block.
+	}
 }
 
 func (a *Actor) Receive() {
@@ -66,6 +80,10 @@ func (a *Actor) Receive() {
 		slog.Info("actor shutting down", "type", a.ref.Type, "id", a.ref.ID)
 
 		atomic.CompareAndSwapInt64(&a.status, int64(ActorStatusActive), int64(ActorStatusInactive))
+
+		if a.onDeactivate != nil {
+			a.onDeactivate(a.ref)
+		}
 
 		if selfStopped && a.onStop != nil {
 			a.onStop(a.ref)
@@ -81,29 +99,49 @@ func (a *Actor) Receive() {
 	ctx := Context{
 		ActorRef: a.ref,
 		host:     a.host,
+		Ctx:      a.actorCtx,
 	}
 
-	for msg := range a.inbox {
-
-		atomic.StoreInt64(&a.lastMessage, time.Now().Unix())
-
-		ctx.SenderHostRef = msg.SenderHostRef
-		ctx.Message = msg.Body
-		ctx.replyId = msg.ReplyID
-
-		err := a.receive(&ctx)
-
-		if err != nil {
-			if errors.Is(err, ErrStopActor) {
-				selfStopped = true
-				break
-			}
-			slog.Error("actor receive error", "type", a.ref.Type, "id", a.ref.ID, "error", err)
-			a.replyWithError(msg, err)
+	for {
+		// Priority check: bail out if context cancelled (host frozen).
+		select {
+		case <-a.actorCtx.Done():
+			return
+		default:
 		}
 
-		if _, ok := msg.Body.(Shutdown); ok {
-			break
+		// Wait for next message or cancellation.
+		select {
+		case <-a.actorCtx.Done():
+			return
+		case msg, ok := <-a.inbox:
+			if !ok {
+				// Inbox closed (force-stop).
+				return
+			}
+
+			atomic.StoreInt64(&a.lastMessage, time.Now().Unix())
+
+			ctx.SenderHostRef = msg.SenderHostRef
+			ctx.Message = msg.Body
+			ctx.replyId = msg.ReplyID
+			ctx.senderHostID = msg.senderHostID
+			ctx.senderAddress = msg.senderAddress
+
+			err := a.receive(&ctx)
+
+			if err != nil {
+				if errors.Is(err, ErrStopActor) {
+					selfStopped = true
+					return
+				}
+				slog.Error("actor receive error", "type", a.ref.Type, "id", a.ref.ID, "error", err)
+				a.replyWithError(msg, err)
+			}
+
+			if _, ok := msg.Body.(Shutdown); ok {
+				return
+			}
 		}
 	}
 }
@@ -115,6 +153,11 @@ func (a *Actor) Shutdown() {
 	})
 
 	<-a.shutdown
+}
+
+func (a *Actor) ForceStop() {
+	a.actorCancel()
+	close(a.inbox)
 }
 
 func (a *Actor) GetLastMessageTime() time.Time {
@@ -148,6 +191,8 @@ func (a *Actor) replyWithError(msg InboxMessage, err error) {
 			IsReply:          true,
 			ReplyID:          msg.ReplyID,
 			Error:            err,
+			recipientHostID:  msg.senderHostID,
+			recipientAddress: msg.senderAddress,
 		})
 	}
 }

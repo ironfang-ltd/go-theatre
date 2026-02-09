@@ -74,3 +74,26 @@ func (am *ActorRegistry) RemoveAll() {
 		delete(am.actors, ref)
 	}
 }
+
+// ForceDeregisterAll removes all actors from the registry without sending
+// Shutdown. Returns the refs of all removed actors so the caller can
+// release ownership for each.
+func (am *ActorRegistry) ForceDeregisterAll() []Ref {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	refs := make([]Ref, 0, len(am.actors))
+	for ref := range am.actors {
+		refs = append(refs, ref)
+	}
+	// Clear the map.
+	am.actors = make(map[Ref]*Actor)
+	return refs
+}
+
+// Count returns the number of registered actors.
+func (am *ActorRegistry) Count() int {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return len(am.actors)
+}
