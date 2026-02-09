@@ -38,6 +38,9 @@ func (c *Context) Request(ref Ref, body interface{}) (any, error) {
 }
 
 func (c *Context) Reply(body interface{}) error {
+	if c.replyId == 0 {
+		return nil // fire-and-forget message, no reply expected
+	}
 
 	c.host.sendInternal(OutboxMessage{
 		RecipientHostRef: c.SenderHostRef,

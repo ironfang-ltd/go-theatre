@@ -213,12 +213,6 @@ func (m *Host) resolveAndForward(ref Ref, msg OutboxMessage) {
 		return
 	}
 
-	// No valid owner. Need a DB to establish ownership via claim.
-	if m.cluster.DB() == nil {
-		m.handleDeadLetter(msg)
-		return
-	}
-
 	// Use ring to determine preferred host.
 	ring := m.cluster.Ring()
 	if ring == nil {

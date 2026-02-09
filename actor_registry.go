@@ -6,58 +6,99 @@ import (
 	"time"
 )
 
+const actorShards = 64
+
+type actorShard struct {
+	mu sync.RWMutex
+	m  map[Ref]*Actor
+}
+
 type ActorRegistry struct {
-	actors sync.Map // map[Ref]*Actor
+	shards [actorShards]actorShard
 }
 
 func NewActorManager() *ActorRegistry {
-	return &ActorRegistry{}
+	am := &ActorRegistry{}
+	for i := range am.shards {
+		am.shards[i].m = make(map[Ref]*Actor)
+	}
+	return am
+}
+
+// refShard returns the shard index for a Ref using inline FNV-1a.
+func refShard(ref Ref) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(ref.Type); i++ {
+		h ^= uint32(ref.Type[i])
+		h *= 16777619
+	}
+	for i := 0; i < len(ref.ID); i++ {
+		h ^= uint32(ref.ID[i])
+		h *= 16777619
+	}
+	return h & (actorShards - 1)
 }
 
 func (am *ActorRegistry) Register(a *Actor) {
-	am.actors.Store(a.ref, a)
+	s := &am.shards[refShard(a.ref)]
+	s.mu.Lock()
+	s.m[a.ref] = a
+	s.mu.Unlock()
 }
 
 func (am *ActorRegistry) Lookup(ref Ref) *Actor {
-	v, ok := am.actors.Load(ref)
-	if !ok {
-		return nil
-	}
-	return v.(*Actor)
+	s := &am.shards[refShard(ref)]
+	s.mu.RLock()
+	a := s.m[ref]
+	s.mu.RUnlock()
+	return a
 }
 
 func (am *ActorRegistry) Remove(ref Ref) {
-	v, loaded := am.actors.LoadAndDelete(ref)
-	if !loaded {
-		return
+	s := &am.shards[refShard(ref)]
+	s.mu.Lock()
+	a, ok := s.m[ref]
+	if ok {
+		delete(s.m, ref)
 	}
-	v.(*Actor).Shutdown()
+	s.mu.Unlock()
+	if ok {
+		a.Shutdown()
+	}
 }
 
 func (am *ActorRegistry) DeregisterOnly(ref Ref) {
-	am.actors.Delete(ref)
+	s := &am.shards[refShard(ref)]
+	s.mu.Lock()
+	delete(s.m, ref)
+	s.mu.Unlock()
 }
 
 func (am *ActorRegistry) RemoveIdle(idleTimeout time.Duration) {
-	am.actors.Range(func(key, value any) bool {
-		ref := key.(Ref)
-		a := value.(*Actor)
-		if time.Since(a.GetLastMessageTime()) > idleTimeout {
-			slog.Info("actor idle, shutting down", "type", ref.Type, "id", ref.ID)
-			am.actors.Delete(ref)
-			a.Shutdown()
+	for i := range am.shards {
+		s := &am.shards[i]
+		s.mu.Lock()
+		for ref, a := range s.m {
+			if time.Since(a.GetLastMessageTime()) > idleTimeout {
+				slog.Info("actor idle, shutting down", "type", ref.Type, "id", ref.ID)
+				delete(s.m, ref)
+				a.Shutdown()
+			}
 		}
-		return true
-	})
+		s.mu.Unlock()
+	}
 }
 
 func (am *ActorRegistry) RemoveAll() {
-	am.actors.Range(func(key, value any) bool {
-		a := value.(*Actor)
-		a.Shutdown()
-		am.actors.Delete(key)
-		return true
-	})
+	for i := range am.shards {
+		s := &am.shards[i]
+		s.mu.Lock()
+		for ref, a := range s.m {
+			a.Shutdown()
+			delete(s.m, ref)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // ForceDeregisterAll removes all actors from the registry without sending
@@ -65,20 +106,26 @@ func (am *ActorRegistry) RemoveAll() {
 // release ownership for each.
 func (am *ActorRegistry) ForceDeregisterAll() []Ref {
 	var refs []Ref
-	am.actors.Range(func(key, value any) bool {
-		refs = append(refs, key.(Ref))
-		am.actors.Delete(key)
-		return true
-	})
+	for i := range am.shards {
+		s := &am.shards[i]
+		s.mu.Lock()
+		for ref := range s.m {
+			refs = append(refs, ref)
+			delete(s.m, ref)
+		}
+		s.mu.Unlock()
+	}
 	return refs
 }
 
 // Count returns the number of registered actors.
 func (am *ActorRegistry) Count() int {
 	count := 0
-	am.actors.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
+	for i := range am.shards {
+		s := &am.shards[i]
+		s.mu.RLock()
+		count += len(s.m)
+		s.mu.RUnlock()
+	}
 	return count
 }

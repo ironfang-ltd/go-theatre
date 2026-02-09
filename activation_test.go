@@ -236,8 +236,8 @@ func TestActivation_ReleaseOnStop(t *testing.T) {
 		t.Fatal("failed to create actor")
 	}
 
-	// Override onDeactivate to track calls.
-	a.onDeactivate = func(r Ref) {
+	// Override onDeactivateHook to track calls.
+	a.onDeactivateHook = func(r Ref) {
 		atomic.AddInt64(&deactivated, 1)
 	}
 
@@ -257,12 +257,12 @@ func TestActivation_ReleaseOnStop(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	if atomic.LoadInt64(&deactivated) == 0 {
-		t.Fatal("onDeactivate was not called")
+		t.Fatal("onDeactivateHook was not called")
 	}
 }
 
 func TestActivation_ReleaseOnSelfStop(t *testing.T) {
-	// Verify onDeactivate fires when actor returns ErrStopActor.
+	// Verify onDeactivateHook fires when actor returns ErrStopActor.
 	h := NewHost(WithIdleTimeout(30 * time.Second))
 	h.Start()
 	defer h.Stop()
@@ -285,7 +285,7 @@ func TestActivation_ReleaseOnSelfStop(t *testing.T) {
 		t.Fatal("failed to create actor")
 	}
 
-	a.onDeactivate = func(r Ref) {
+	a.onDeactivateHook = func(r Ref) {
 		atomic.AddInt64(&deactivated, 1)
 	}
 
@@ -298,7 +298,7 @@ func TestActivation_ReleaseOnSelfStop(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	if atomic.LoadInt64(&deactivated) == 0 {
-		t.Fatal("onDeactivate was not called on self-stop")
+		t.Fatal("onDeactivateHook was not called on self-stop")
 	}
 }
 

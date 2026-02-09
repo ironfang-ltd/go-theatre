@@ -88,7 +88,6 @@ func (m *Host) activateActor(ref Ref, claim bool) (*Actor, error) {
 		return nil, gate.err
 	}
 
-	m.metrics.ActivationsTotal.Add(1)
 	gate.actor = a
 	return a, nil
 }
@@ -98,8 +97,16 @@ func (m *Host) activateActor(ref Ref, claim bool) (*Actor, error) {
 // allows the update when no live host currently owns the actor.
 // Returns the claim result indicating whether this host won.
 func (m *Host) claimOwnership(ref Ref) (*ClaimResult, error) {
-	if m.cluster == nil || m.cluster.DB() == nil {
+	if m.cluster == nil {
 		return nil, nil
+	}
+	if m.cluster.DB() == nil {
+		return &ClaimResult{
+			OwnerHostID: m.cluster.LocalHostID(),
+			OwnerEpoch:  m.cluster.LocalEpoch(),
+			Won:         true,
+			Reason:      ActivationNew,
+		}, nil
 	}
 
 	hostID := m.cluster.LocalHostID()

@@ -15,22 +15,29 @@ type Request struct {
 	ID       int64
 	To       Ref
 	Response chan *Response
-	SentAt   time.Time
+	sentAt   int64 // Unix seconds from coarse clock
 }
 
 func (r *Request) Timeout() {
 	r.Response <- &Response{Error: ErrRequestTimeout}
 }
 
+const requestShards = 64
+
+type requestShard struct {
+	mu sync.Mutex
+	m  map[int64]*Request
+}
+
 type RequestManager struct {
-	requests sync.Map // map[int64]*Request
-	reqPool  sync.Pool
-	resPool  *sync.Pool // shared Response pool (set by Host after construction)
-	reqID    int64
+	shards  [requestShards]requestShard
+	reqPool sync.Pool
+	resPool *sync.Pool // shared Response pool (set by Host after construction)
+	reqID   int64
 }
 
 func NewRequestManager() *RequestManager {
-	return &RequestManager{
+	rm := &RequestManager{
 		reqPool: sync.Pool{
 			New: func() interface{} {
 				return &Request{
@@ -39,6 +46,14 @@ func NewRequestManager() *RequestManager {
 			},
 		},
 	}
+	for i := range rm.shards {
+		rm.shards[i].m = make(map[int64]*Request)
+	}
+	return rm
+}
+
+func (rm *RequestManager) shard(id int64) *requestShard {
+	return &rm.shards[id&(requestShards-1)]
 }
 
 func (rm *RequestManager) Create(ref Ref) *Request {
@@ -54,56 +69,71 @@ func (rm *RequestManager) Create(ref Ref) *Request {
 
 	r.ID = reqID
 	r.To = ref
-	r.SentAt = time.Now()
+	r.sentAt = coarseNow.Load()
 
-	rm.requests.Store(r.ID, r)
+	s := rm.shard(reqID)
+	s.mu.Lock()
+	s.m[reqID] = r
+	s.mu.Unlock()
 
 	return r
 }
 
 func (rm *RequestManager) Get(id int64) *Request {
-	v, ok := rm.requests.Load(id)
-	if !ok {
-		return nil
-	}
-	return v.(*Request)
+	s := rm.shard(id)
+	s.mu.Lock()
+	r := s.m[id]
+	s.mu.Unlock()
+	return r
 }
 
 func (rm *RequestManager) Remove(id int64) {
-	v, loaded := rm.requests.LoadAndDelete(id)
-	if !loaded {
-		return
+	s := rm.shard(id)
+	s.mu.Lock()
+	r, ok := s.m[id]
+	if ok {
+		delete(s.m, id)
 	}
-	rm.reqPool.Put(v)
+	s.mu.Unlock()
+	if ok {
+		rm.reqPool.Put(r)
+	}
 }
 
 func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
 	expired := 0
-	rm.requests.Range(func(key, value any) bool {
-		req := value.(*Request)
-		if time.Since(req.SentAt) > requestTimeout {
-			rm.requests.Delete(key)
-			res := rm.getResponse()
-			res.Error = ErrRequestTimeout
-			req.Response <- res
-			expired++
+	cutoff := coarseNow.Load() - int64(requestTimeout.Seconds())
+	for i := range rm.shards {
+		s := &rm.shards[i]
+		s.mu.Lock()
+		for id, req := range s.m {
+			if req.sentAt < cutoff {
+				delete(s.m, id)
+				res := rm.getResponse()
+				res.Error = ErrRequestTimeout
+				req.Response <- res
+				expired++
+			}
 		}
-		return true
-	})
+		s.mu.Unlock()
+	}
 	return expired
 }
 
 // FailAll sends an error response to all pending requests and removes
 // them from the manager. Used during freeze to unblock waiting callers.
 func (rm *RequestManager) FailAll(err error) {
-	rm.requests.Range(func(key, value any) bool {
-		req := value.(*Request)
-		res := rm.getResponse()
-		res.Error = err
-		req.Response <- res
-		rm.requests.Delete(key)
-		return true
-	})
+	for i := range rm.shards {
+		s := &rm.shards[i]
+		s.mu.Lock()
+		for id, req := range s.m {
+			res := rm.getResponse()
+			res.Error = err
+			req.Response <- res
+			delete(s.m, id)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // getResponse returns a Response from the shared pool, or allocates

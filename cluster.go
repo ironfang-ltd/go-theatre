@@ -88,6 +88,28 @@ func NewCluster(db SQLDB, config ClusterConfig) *Cluster {
 	}
 }
 
+// NewRingOnlyCluster creates a Cluster with no database connection.
+// It uses only a hash ring for deterministic actor placement.
+// No Start() call is needed — there are no background goroutines.
+// Stop() is safe to call (closes done channel, no-ops on empty WaitGroup).
+func NewRingOnlyCluster(hostID string, address string, epoch int64) *Cluster {
+	c := &Cluster{
+		config: ClusterConfig{HostID: hostID, Address: address},
+		ring:   NewHashRing(),
+		done:   make(chan struct{}),
+	}
+	c.epoch = epoch
+	return c
+}
+
+// SetHosts updates the live host list. Used by ring-only clusters where
+// hosts are known statically rather than discovered via polling.
+func (c *Cluster) SetHosts(hosts []HostInfo) {
+	c.mu.Lock()
+	c.hosts = hosts
+	c.mu.Unlock()
+}
+
 // Start acquires the advisory lock, registers this host (bumping the epoch),
 // performs an initial host poll + ring build, and launches background
 // goroutines for lease renewal and polling.

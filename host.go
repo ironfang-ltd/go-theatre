@@ -125,8 +125,8 @@ func (m *Host) Start() {
 		go m.processInbox()
 	}
 
-	// Start freeze monitor in cluster mode.
-	if m.cluster != nil {
+	// Start freeze monitor in cluster mode (requires DB for lease checks).
+	if m.cluster != nil && m.cluster.DB() != nil {
 		go m.freezeMonitor()
 	}
 
@@ -184,6 +184,7 @@ func (m *Host) sendInternal(msg OutboxMessage) {
 				res.Error = msg.Error
 				req.Response <- res
 			}
+			m.metrics.MessagesReceived.Add(1)
 			return
 		}
 
@@ -196,6 +197,7 @@ func (m *Host) sendInternal(msg OutboxMessage) {
 				Body:          msg.Body,
 				ReplyID:       msg.ReplyID,
 			})
+			m.metrics.MessagesReceived.Add(1)
 			return
 		}
 		m.inbox <- InboxMessage{
@@ -267,26 +269,27 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 		return nil
 	}
 
-	// Standalone mode.
+	// Standalone mode — fast path: deliver directly to existing actor.
+	if a := m.actors.Lookup(ref); a != nil {
+		a.Send(InboxMessage{
+			SenderHostRef: m.hostRef,
+			RecipientRef:  ref,
+			Body:          body,
+		})
+		m.metrics.MessagesSent.Add(1)
+		m.metrics.MessagesReceived.Add(1)
+		return nil
+	}
+
+	// Slow path: actor doesn't exist yet, validate type then route through inbox.
 	if !m.hasDescriptor(ref.Type) {
 		return ErrUnregisteredActorType
 	}
-
-	msg := InboxMessage{
+	m.inbox <- InboxMessage{
 		SenderHostRef: m.hostRef,
 		RecipientRef:  ref,
 		Body:          body,
 	}
-
-	// Fast path: deliver directly to existing actor, skip inbox channel.
-	if a := m.actors.Lookup(ref); a != nil {
-		a.Send(msg)
-		m.metrics.MessagesSent.Add(1)
-		return nil
-	}
-
-	// Slow path: actor doesn't exist yet, route through inbox for creation.
-	m.inbox <- msg
 	m.metrics.MessagesSent.Add(1)
 	return nil
 }
@@ -325,6 +328,7 @@ func (m *Host) requestInternal(ref Ref, body interface{}) (interface{}, error) {
 		// Fast path: deliver directly to existing actor, skip inbox channel.
 		if a := m.actors.Lookup(ref); a != nil {
 			a.Send(msg)
+			m.metrics.MessagesReceived.Add(1)
 		} else {
 			// Slow path: actor doesn't exist yet, route through inbox.
 			m.inbox <- msg
@@ -450,12 +454,9 @@ func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 	receiver := d.Create()
 
 	a := NewActor(m, ref, receiver, parentCtx, m.config.actorInboxSize)
-	a.onStop = func(r Ref) {
-		m.actors.DeregisterOnly(r)
-	}
-	a.onDeactivate = func(r Ref) {
-		m.releaseOwnership(r)
-	}
+	a.noPanicRecovery = !m.config.panicRecovery
+	a.selfDeregister = true
+	a.releaseOnStop = true
 	go a.Receive()
 
 	a.Send(InboxMessage{
@@ -465,6 +466,7 @@ func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 	})
 
 	m.actors.Register(a)
+	m.metrics.ActivationsTotal.Add(1)
 
 	return a
 }

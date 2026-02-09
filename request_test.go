@@ -73,8 +73,8 @@ func TestRequestManager_RemoveExpired(t *testing.T) {
 
 	req := rm.Create(ref)
 
-	// backdate SentAt so it appears expired
-	req.SentAt = time.Now().Add(-10 * time.Second)
+	// backdate sentAt so it appears expired
+	req.sentAt = coarseNow.Load() - 10
 
 	rm.RemoveExpired(5 * time.Second)
 
@@ -102,7 +102,7 @@ func TestRequestManager_RemoveExpiredKeepsFresh(t *testing.T) {
 	fresh := rm.Create(ref)
 
 	expired := rm.Create(ref)
-	expired.SentAt = time.Now().Add(-10 * time.Second)
+	expired.sentAt = coarseNow.Load() - 10
 
 	rm.RemoveExpired(5 * time.Second)
 

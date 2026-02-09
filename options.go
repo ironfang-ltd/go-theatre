@@ -24,9 +24,10 @@ type hostConfig struct {
 	maxRenewalFailures int           // trigger freeze after N consecutive renewal failures
 
 	// Throughput tuning.
-	actorInboxSize int // per-actor inbox buffer (default 64)
-	hostInboxSize  int // host inbox channel buffer (default 4096)
-	inboxWorkers   int // number of processInbox goroutines (default GOMAXPROCS)
+	actorInboxSize int  // per-actor inbox buffer (default 64)
+	hostInboxSize  int  // host inbox channel buffer (default 4096)
+	inboxWorkers   int  // number of processInbox goroutines (default GOMAXPROCS)
+	panicRecovery  bool // wrap receiver.Receive in defer/recover (default true)
 
 	// Admin server address (e.g. "127.0.0.1:9090"). Empty = disabled.
 	adminAddr string
@@ -51,6 +52,7 @@ func defaultHostConfig() hostConfig {
 		actorInboxSize:     64,
 		hostInboxSize:      4096,
 		inboxWorkers:       runtime.GOMAXPROCS(0),
+		panicRecovery:      true,
 	}
 }
 
@@ -144,6 +146,16 @@ func WithHostInboxSize(n int) Option {
 func WithInboxWorkers(n int) Option {
 	return func(c *hostConfig) {
 		c.inboxWorkers = n
+	}
+}
+
+// WithPanicRecovery controls whether actor Receive calls are wrapped in a
+// defer/recover block. Enabled by default. Disabling eliminates the
+// per-message defer+closure overhead (~50-100ns) but means a panic in a
+// Receiver will crash the entire process instead of being caught.
+func WithPanicRecovery(enabled bool) Option {
+	return func(c *hostConfig) {
+		c.panicRecovery = enabled
 	}
 }
 

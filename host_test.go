@@ -342,7 +342,7 @@ func TestRequest_UnregisteredActor(t *testing.T) {
 	req := host.requests.Create(ref)
 
 	// simulate immediate expiry
-	req.SentAt = req.SentAt.Add(-10 * time.Second)
+	req.sentAt = coarseNow.Load() - 10
 
 	host.requests.RemoveExpired(5 * time.Second)
 

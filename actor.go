@@ -24,15 +24,17 @@ const (
 )
 
 type Actor struct {
-	host         *Host
-	ref          Ref
-	receiver     Receiver
-	inbox        chan InboxMessage
-	shutdown     chan bool
-	lastMessage  int64
-	status       int64
-	onStop       func(Ref)
-	onDeactivate func(Ref)
+	host            *Host
+	ref             Ref
+	receiver        Receiver
+	inbox           chan InboxMessage
+	shutdown        chan bool
+	lastMessage     int64
+	status          int64
+	selfDeregister   bool        // true = onStop deregisters from actor registry
+	releaseOnStop    bool        // true = onDeactivate releases cluster ownership
+	onDeactivateHook func(Ref)   // test-only; nil in production (no alloc)
+	noPanicRecovery bool
 
 	// Context derived from the host's freezeCtx. Cancelled when the host
 	// enters frozen state so the actor can exit cleanly.
@@ -77,16 +79,19 @@ func (a *Actor) Receive() {
 
 	defer (func() {
 
-		slog.Info("actor shutting down", "type", a.ref.Type, "id", a.ref.ID)
+		slog.Debug("actor shutting down", "type", a.ref.Type, "id", a.ref.ID)
 
 		atomic.CompareAndSwapInt64(&a.status, int64(ActorStatusActive), int64(ActorStatusInactive))
 
-		if a.onDeactivate != nil {
-			a.onDeactivate(a.ref)
+		if a.releaseOnStop {
+			a.host.releaseOwnership(a.ref)
+		}
+		if a.onDeactivateHook != nil {
+			a.onDeactivateHook(a.ref)
 		}
 
-		if selfStopped && a.onStop != nil {
-			a.onStop(a.ref)
+		if selfStopped && a.selfDeregister {
+			a.host.actors.DeregisterOnly(a.ref)
 		}
 
 		a.shutdown <- true
@@ -94,7 +99,7 @@ func (a *Actor) Receive() {
 
 	atomic.CompareAndSwapInt64(&a.status, int64(ActorStatusInactive), int64(ActorStatusActive))
 
-	slog.Info("actor started", "type", a.ref.Type, "id", a.ref.ID)
+	slog.Debug("actor started", "type", a.ref.Type, "id", a.ref.ID)
 
 	ctx := Context{
 		ActorRef: a.ref,
@@ -120,7 +125,7 @@ func (a *Actor) Receive() {
 				return
 			}
 
-			atomic.StoreInt64(&a.lastMessage, time.Now().Unix())
+			atomic.StoreInt64(&a.lastMessage, coarseNow.Load())
 
 			ctx.SenderHostRef = msg.SenderHostRef
 			ctx.Message = msg.Body
@@ -128,7 +133,12 @@ func (a *Actor) Receive() {
 			ctx.senderHostID = msg.senderHostID
 			ctx.senderAddress = msg.senderAddress
 
-			err := a.receive(&ctx)
+			var err error
+			if a.noPanicRecovery {
+				err = a.receiver.Receive(&ctx)
+			} else {
+				err = a.receive(&ctx)
+			}
 
 			if err != nil {
 				if errors.Is(err, ErrStopActor) {
