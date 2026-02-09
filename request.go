@@ -25,6 +25,7 @@ func (r *Request) Timeout() {
 type RequestManager struct {
 	requests sync.Map // map[int64]*Request
 	reqPool  sync.Pool
+	resPool  *sync.Pool // shared Response pool (set by Host after construction)
 	reqID    int64
 }
 
@@ -82,7 +83,9 @@ func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
 		req := value.(*Request)
 		if time.Since(req.SentAt) > requestTimeout {
 			rm.requests.Delete(key)
-			req.Timeout()
+			res := rm.getResponse()
+			res.Error = ErrRequestTimeout
+			req.Response <- res
 			expired++
 		}
 		return true
@@ -95,8 +98,22 @@ func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
 func (rm *RequestManager) FailAll(err error) {
 	rm.requests.Range(func(key, value any) bool {
 		req := value.(*Request)
-		req.Response <- &Response{Error: err}
+		res := rm.getResponse()
+		res.Error = err
+		req.Response <- res
 		rm.requests.Delete(key)
 		return true
 	})
+}
+
+// getResponse returns a Response from the shared pool, or allocates
+// a fresh one if the pool is not set (e.g. in standalone tests).
+func (rm *RequestManager) getResponse() *Response {
+	if rm.resPool != nil {
+		res := rm.resPool.Get().(*Response)
+		res.Body = nil
+		res.Error = nil
+		return res
+	}
+	return &Response{}
 }

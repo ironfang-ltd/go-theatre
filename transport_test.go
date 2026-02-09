@@ -1,6 +1,10 @@
 package theatre
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -531,5 +535,368 @@ func TestTransport_CustomBodyType(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for custom body message")
+	}
+}
+
+// --- benchmarks ---
+
+// benchmarkMessages returns the set of envelopes used across benchmarks.
+func benchmarkMessages() map[string]TransportEnvelope {
+	return map[string]TransportEnvelope{
+		"ActorForward": testEnvelope(ActorForward{
+			ActorType:    "greeter",
+			ActorID:      "abc-123",
+			Body:         "hello world",
+			ReplyID:      42,
+			SenderHostID: "host-a",
+		}),
+		"ActorForwardReply": testEnvelope(ActorForwardReply{
+			ReplyID: 99,
+			Body:    "response payload",
+			Error:   "something went wrong",
+		}),
+		"Ping": testEnvelope(TransportPing{}),
+	}
+}
+
+// encodeFrame encodes an envelope into its wire format (for read-side benchmarks).
+func encodeFrame(env TransportEnvelope) []byte {
+	var gobBuf bytes.Buffer
+	if err := gob.NewEncoder(&gobBuf).Encode(env.Payload); err != nil {
+		panic(err)
+	}
+	gobBytes := gobBuf.Bytes()
+	frameLen := 1 + len(gobBytes)
+	frame := make([]byte, 4+frameLen)
+	binary.BigEndian.PutUint32(frame[:4], uint32(frameLen))
+	frame[4] = env.Tag
+	copy(frame[5:], gobBytes)
+	return frame
+}
+
+// BenchmarkWriteFrame measures the encode + frame-build + write path.
+// A goroutine drains the read end of the pipe so writes never block.
+func BenchmarkWriteFrame(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+
+			// Drain reader in background.
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				io.Copy(io.Discard, c2)
+			}()
+			defer func() {
+				c2.Close()
+				<-done
+			}()
+
+			p := &transportPeer{hostID: "bench", conn: c1}
+			tr := &Transport{}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := tr.writeFrame(p, env); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkReadFrame measures the frame-parse + gob-decode path.
+// Pre-encodes frames into a large buffer so reads don't block.
+func BenchmarkReadFrame(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			// Pre-encode one frame.
+			single := encodeFrame(env)
+			b.ReportMetric(float64(len(single)), "bytes/frame")
+
+			// Build a buffer with b.N copies (or a large batch we cycle through).
+			const batch = 4096
+			var buf bytes.Buffer
+			for i := 0; i < batch; i++ {
+				buf.Write(single)
+			}
+			data := buf.Bytes()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// Wrap a reader over the pre-encoded batch, cycling as needed.
+				offset := (i % batch) * len(single)
+				r := bytes.NewReader(data[offset : offset+len(single)])
+				if _, err := readFrame(r); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkRoundTrip measures the full production write + read path through
+// a net.Pipe, using per-peer encoder and per-connection decoder (matching
+// the readLoop path).
+func BenchmarkRoundTrip(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+			defer c2.Close()
+
+			p := &transportPeer{hostID: "bench", conn: c1}
+			tr := &Transport{}
+
+			// Persistent decoder (matches readLoop).
+			var decBuf bytes.Buffer
+			dec := gob.NewDecoder(&decBuf)
+
+			errCh := make(chan error, 1)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				go func() {
+					errCh <- tr.writeFrame(p, env)
+				}()
+				if _, err := decodeFrame(c2, dec, &decBuf); err != nil {
+					b.Fatal(err)
+				}
+				if err := <-errCh; err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGobEncode isolates the gob encoding cost (no framing, no IO).
+func BenchmarkGobEncode(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			var buf bytes.Buffer
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				buf.Reset()
+				if err := gob.NewEncoder(&buf).Encode(env.Payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGobDecode isolates the gob decoding cost (no framing, no IO).
+func BenchmarkGobDecode(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			// Pre-encode.
+			var buf bytes.Buffer
+			if err := gob.NewEncoder(&buf).Encode(env.Payload); err != nil {
+				b.Fatal(err)
+			}
+			encoded := buf.Bytes()
+			b.ReportMetric(float64(len(encoded)), "bytes/gob")
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				dec := gob.NewDecoder(bytes.NewReader(encoded))
+				switch env.Tag {
+				case TagActorForward:
+					var v ActorForward
+					if err := dec.Decode(&v); err != nil {
+						b.Fatal(err)
+					}
+				case TagActorForwardReply:
+					var v ActorForwardReply
+					if err := dec.Decode(&v); err != nil {
+						b.Fatal(err)
+					}
+				case TagPing:
+					var v TransportPing
+					if err := dec.Decode(&v); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkDecodeFrame measures the optimized decode path with a persistent
+// decoder. Frames are pre-encoded with a persistent encoder (matching the
+// production writeFrame path) so steady-state frames omit type descriptions.
+func BenchmarkDecodeFrame(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			// Pre-encode a batch of frames using a persistent encoder.
+			var encBuf bytes.Buffer
+			enc := gob.NewEncoder(&encBuf)
+
+			const batch = 4096
+			frames := make([][]byte, batch)
+			for i := range frames {
+				encBuf.Reset()
+				if err := enc.Encode(env.Payload); err != nil {
+					b.Fatal(err)
+				}
+				gobBytes := encBuf.Bytes()
+				frameLen := 1 + len(gobBytes)
+				frame := make([]byte, 4+frameLen)
+				binary.BigEndian.PutUint32(frame[:4], uint32(frameLen))
+				frame[4] = env.Tag
+				copy(frame[5:], gobBytes)
+				frames[i] = frame
+			}
+
+			// Report steady-state frame size (frame[1+] after type warmup).
+			b.ReportMetric(float64(len(frames[batch-1])), "bytes/frame")
+
+			// Concatenate frames into a single stream for the decoder.
+			// First frame has type descriptions; decoder warms up on it.
+			var stream bytes.Buffer
+			for _, f := range frames {
+				stream.Write(f)
+			}
+			streamBytes := stream.Bytes()
+
+			// Persistent decoder.
+			var decBuf bytes.Buffer
+			dec := gob.NewDecoder(&decBuf)
+
+			// Warm up: decode first frame (has type info).
+			r := bytes.NewReader(streamBytes[:len(frames[0])])
+			if _, err := decodeFrame(r, dec, &decBuf); err != nil {
+				b.Fatal(err)
+			}
+
+			// Build steady-state stream (skip first frame).
+			offset0 := len(frames[0])
+			steadyBytes := streamBytes[offset0:]
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			steadyLen := len(steadyBytes)
+			frameSize := len(frames[1]) // all steady-state frames are identical
+			for i := 0; i < b.N; i++ {
+				offset := (i * frameSize) % steadyLen
+				if offset+frameSize > steadyLen {
+					offset = 0
+				}
+				r := bytes.NewReader(steadyBytes[offset : offset+frameSize])
+				if _, err := decodeFrame(r, dec, &decBuf); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGobEncodeReuse isolates the gob encoding cost with a reused
+// encoder (type cache populated). Compare against BenchmarkGobEncode.
+func BenchmarkGobEncodeReuse(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			var buf bytes.Buffer
+			enc := gob.NewEncoder(&buf)
+
+			// Warm up: encode one message to populate type cache.
+			if err := enc.Encode(env.Payload); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				buf.Reset()
+				if err := enc.Encode(env.Payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGobDecodeReuse isolates the gob decoding cost with a reused
+// decoder (type cache populated). Compare against BenchmarkGobDecode.
+func BenchmarkGobDecodeReuse(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			// Produce frames with a persistent encoder.
+			var encBuf bytes.Buffer
+			enc := gob.NewEncoder(&encBuf)
+
+			// Warm-up frame (has type info).
+			enc.Encode(env.Payload)
+			warmupGob := append([]byte(nil), encBuf.Bytes()...)
+
+			// Steady-state frame (no type info).
+			encBuf.Reset()
+			enc.Encode(env.Payload)
+			steadyGob := append([]byte(nil), encBuf.Bytes()...)
+
+			b.ReportMetric(float64(len(steadyGob)), "bytes/gob")
+
+			// Persistent decoder with warmup.
+			var decBuf bytes.Buffer
+			dec := gob.NewDecoder(&decBuf)
+			decBuf.Write(warmupGob)
+			switch env.Tag {
+			case TagActorForward:
+				var v ActorForward
+				dec.Decode(&v)
+			case TagActorForwardReply:
+				var v ActorForwardReply
+				dec.Decode(&v)
+			case TagPing:
+				var v TransportPing
+				dec.Decode(&v)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				decBuf.Reset()
+				decBuf.Write(steadyGob)
+				switch env.Tag {
+				case TagActorForward:
+					var v ActorForward
+					if err := dec.Decode(&v); err != nil {
+						b.Fatal(err)
+					}
+				case TagActorForwardReply:
+					var v ActorForwardReply
+					if err := dec.Decode(&v); err != nil {
+						b.Fatal(err)
+					}
+				case TagPing:
+					var v TransportPing
+					if err := dec.Decode(&v); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkFrameSize reports the wire size of each message type (not a speed benchmark).
+func BenchmarkFrameSize(b *testing.B) {
+	for name, env := range benchmarkMessages() {
+		b.Run(name, func(b *testing.B) {
+			frame := encodeFrame(env)
+			b.ReportMetric(float64(len(frame)), "wire-bytes")
+			b.ReportMetric(float64(len(frame)-5), "gob-bytes")
+			// Run b.N iterations to satisfy the benchmark framework.
+			for i := 0; i < b.N; i++ {
+			}
+		})
 	}
 }

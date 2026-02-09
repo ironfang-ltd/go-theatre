@@ -62,12 +62,28 @@ type Transport struct {
 	stopOnce sync.Once
 }
 
+// maxFramePayload is the upper bound on a single frame's payload
+// (tag byte + gob bytes). Frames larger than this are rejected on read.
+const maxFramePayload = 16 << 20 // 16 MB
+
+// readBufPool recycles byte slices used to read frame payloads.
+// Keyed by *[]byte to avoid interface-boxing allocations.
+var readBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256)
+		return &b
+	},
+}
+
 type transportPeer struct {
 	hostID  string
 	address string
 
-	mu   sync.Mutex // guards conn writes and conn lifecycle
-	conn net.Conn
+	mu       sync.Mutex // guards conn writes, conn lifecycle, and encoder
+	conn     net.Conn
+	enc      *gob.Encoder   // per-connection encoder; nil until first write
+	encBuf   bytes.Buffer   // backing buffer for enc
+	frameBuf []byte         // reusable frame buffer (avoids alloc per write)
 }
 
 // NewTransport creates a transport that listens on listenAddr.
@@ -202,6 +218,7 @@ func (t *Transport) handleInbound(conn net.Conn) {
 	p.mu.Lock()
 	old := p.conn
 	p.conn = conn
+	p.enc = nil // new connection; reset encoder type cache
 	p.mu.Unlock()
 
 	if old != nil {
@@ -262,6 +279,7 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 	}
 
 	p.conn = conn
+	p.enc = nil // new connection; reset encoder type cache
 	p.mu.Unlock() // unlock before starting the read goroutine
 
 	slog.Info("transport peer connected", "direction", "outbound", "remote", hostID, "address", address)
@@ -278,8 +296,13 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 // --- read loop ---
 
 func (t *Transport) readLoop(remoteID string, conn net.Conn) {
+	// Per-connection decoder: retains type info across frames so only the
+	// first message of a given type pays the type-description overhead.
+	var decBuf bytes.Buffer
+	dec := gob.NewDecoder(&decBuf)
+
 	for {
-		env, err := readFrame(conn)
+		env, err := decodeFrame(conn, dec, &decBuf)
 		if err != nil {
 			select {
 			case <-t.done:
@@ -311,24 +334,16 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 // writeFrame encodes env into a single frame and writes it atomically
 // (single conn.Write) while holding the peer's write lock.
 //
+// The encoder is created lazily on first write and reused across messages.
+// Gob encoders cache type descriptions, so only the first message of a given
+// type includes the type preamble; subsequent messages are significantly
+// smaller and faster to encode. The encoder is reset when the connection
+// drops or is replaced (new connection = new gob stream).
+//
 // A write deadline of transportWriteTimeout is set before each write and
 // cleared on success. If the write times out or fails, the connection is
 // closed and cleared so the next SendTo will reconnect.
 func (t *Transport) writeFrame(p *transportPeer, env TransportEnvelope) error {
-	// Encode the payload.
-	var gobBuf bytes.Buffer
-	if err := gob.NewEncoder(&gobBuf).Encode(env.Payload); err != nil {
-		return fmt.Errorf("transport encode: %w", err)
-	}
-	gobBytes := gobBuf.Bytes()
-
-	// Build the complete frame: [4-byte length][1-byte tag][gob bytes]
-	frameLen := 1 + len(gobBytes)
-	frame := make([]byte, 4+frameLen)
-	binary.BigEndian.PutUint32(frame[:4], uint32(frameLen))
-	frame[4] = env.Tag
-	copy(frame[5:], gobBytes)
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -336,10 +351,37 @@ func (t *Transport) writeFrame(p *transportPeer, env TransportEnvelope) error {
 		return fmt.Errorf("transport: peer %s not connected", p.hostID)
 	}
 
+	// Lazy-init encoder for this connection. The encoder caches type
+	// descriptions so subsequent messages of the same type are smaller.
+	if p.enc == nil {
+		p.encBuf.Reset()
+		p.enc = gob.NewEncoder(&p.encBuf)
+	}
+
+	// Encode payload, reusing the encoder's type cache.
+	p.encBuf.Reset()
+	if err := p.enc.Encode(env.Payload); err != nil {
+		return fmt.Errorf("transport encode: %w", err)
+	}
+	gobBytes := p.encBuf.Bytes()
+
+	// Build the complete frame: [4-byte length][1-byte tag][gob bytes]
+	frameLen := 1 + len(gobBytes)
+	needed := 4 + frameLen
+	if cap(p.frameBuf) < needed {
+		p.frameBuf = make([]byte, needed)
+	} else {
+		p.frameBuf = p.frameBuf[:needed]
+	}
+	binary.BigEndian.PutUint32(p.frameBuf[:4], uint32(frameLen))
+	p.frameBuf[4] = env.Tag
+	copy(p.frameBuf[5:], gobBytes)
+
 	p.conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
-	if _, err := p.conn.Write(frame); err != nil {
+	if _, err := p.conn.Write(p.frameBuf); err != nil {
 		p.conn.Close()
 		p.conn = nil
+		p.enc = nil
 		return fmt.Errorf("transport write: %w", err)
 	}
 	p.conn.SetWriteDeadline(time.Time{}) // clear deadline on success
@@ -347,10 +389,24 @@ func (t *Transport) writeFrame(p *transportPeer, env TransportEnvelope) error {
 	return nil
 }
 
-// readFrame reads a single framed message from r.
-// On return, Payload is a pointer to the decoded concrete type
-// (e.g. *ActorForward, *ActorForwardReply, etc.).
+// readFrame reads a single framed message from r using a fresh gob decoder.
+// Used by tests for simple one-shot round-trips. Production code uses
+// decodeFrame with a persistent decoder (see readLoop).
 func readFrame(r io.Reader) (TransportEnvelope, error) {
+	var decBuf bytes.Buffer
+	dec := gob.NewDecoder(&decBuf)
+	return decodeFrame(r, dec, &decBuf)
+}
+
+// decodeFrame reads a single framed message from r using a persistent gob
+// decoder. The decoder retains type information across calls, so only the
+// first message of a given type includes the full type description; subsequent
+// messages of the same type decode with dramatically fewer allocations.
+//
+// decBuf must be the same bytes.Buffer that was passed to gob.NewDecoder
+// when creating dec. The caller creates both once per connection and reuses
+// them for every frame.
+func decodeFrame(r io.Reader, dec *gob.Decoder, decBuf *bytes.Buffer) (TransportEnvelope, error) {
 	// Read 4-byte payload length.
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
@@ -360,20 +416,32 @@ func readFrame(r io.Reader) (TransportEnvelope, error) {
 	if payloadLen < 1 {
 		return TransportEnvelope{}, fmt.Errorf("transport: frame length %d too small", payloadLen)
 	}
-	const maxFrameSize = 16 << 20 // 16 MB
-	if payloadLen > maxFrameSize {
+	if payloadLen > maxFramePayload {
 		return TransportEnvelope{}, fmt.Errorf("transport: frame too large (%d bytes)", payloadLen)
 	}
 
-	// Read [tag][gob payload].
-	buf := make([]byte, payloadLen)
+	// Read [tag][gob payload] into a pooled buffer.
+	bp := readBufPool.Get().(*[]byte)
+	buf := *bp
+	if cap(buf) < int(payloadLen) {
+		buf = make([]byte, payloadLen)
+	} else {
+		buf = buf[:payloadLen]
+	}
 	if _, err := io.ReadFull(r, buf); err != nil {
+		*bp = buf
+		readBufPool.Put(bp)
 		return TransportEnvelope{}, fmt.Errorf("transport: incomplete frame: %w", err)
 	}
 
 	tag := buf[0]
-	gobBytes := buf[1:]
-	dec := gob.NewDecoder(bytes.NewReader(gobBytes))
+
+	// Feed gob bytes to the persistent decoder's buffer.
+	// decBuf.Write copies the data, so we can return buf to the pool.
+	decBuf.Reset()
+	decBuf.Write(buf[1:])
+	*bp = buf
+	readBufPool.Put(bp)
 
 	var payload interface{}
 	switch tag {

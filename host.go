@@ -105,6 +105,7 @@ func NewHost(opts ...Option) *Host {
 	}
 
 	metrics.actorCountFn = h.actors.Count
+	h.requests.resPool = &h.resPool
 
 	return h
 }
@@ -336,9 +337,7 @@ func (m *Host) requestInternal(ref Ref, body interface{}) (interface{}, error) {
 		}
 	}
 
-	defer (func() {
-		m.requests.Remove(req.ID)
-	})()
+	defer m.requests.Remove(req.ID)
 
 	res := <-req.Response
 

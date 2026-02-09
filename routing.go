@@ -3,6 +3,7 @@ package theatre
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 )
@@ -375,7 +376,7 @@ func (m *Host) handleActorForwardReply(msg *ActorForwardReply) {
 	res := m.resPool.Get().(*Response)
 	res.Body = msg.Body
 	if msg.Error != "" {
-		res.Error = fmt.Errorf("%s", msg.Error)
+		res.Error = errors.New(msg.Error)
 	} else {
 		res.Error = nil
 	}
