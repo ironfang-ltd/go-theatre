@@ -44,6 +44,7 @@ type Host struct {
 	// Cluster routing (nil in standalone mode).
 	transport      *Transport
 	cluster        *Cluster
+	localHostID    string // cached from cluster.LocalHostID(); set in SetCluster
 	placementCache *PlacementCache
 
 	// Pending remote requests awaiting reply or NotHere.
@@ -318,7 +319,7 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 		// bypassing the outbox channel entirely.
 		if m.placementCache != nil {
 			if entry, ok := m.placementCache.Get(ref); ok {
-				if entry.HostID != m.cluster.LocalHostID() && m.isEntryLive(entry) {
+				if entry.HostID != m.localHostID && m.isEntryLive(entry) {
 					msg := OutboxMessage{RecipientRef: ref, Body: body}
 					if err := m.forwardToRemote(entry.HostID, entry.Address, ref, msg); err == nil {
 						m.metrics.MessagesSent.Add(1)
@@ -412,7 +413,7 @@ func (m *Host) requestInternal(ref Ref, body interface{}) (interface{}, error) {
 			// Placement cache fast path: forward directly to remote peer.
 			if m.placementCache != nil {
 				if entry, ok := m.placementCache.Get(ref); ok {
-					if entry.HostID != m.cluster.LocalHostID() && m.isEntryLive(entry) {
+					if entry.HostID != m.localHostID && m.isEntryLive(entry) {
 						outMsg := OutboxMessage{RecipientRef: ref, Body: body, ReplyID: req.ID}
 						if err := m.forwardToRemote(entry.HostID, entry.Address, ref, outMsg); err == nil {
 							m.metrics.PlacementCacheHits.Add(1)

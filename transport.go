@@ -11,9 +11,9 @@ package theatre
 //   - Each peer has a dedicated writer goroutine that reads from a send
 //     channel and writes frames. This eliminates write contention — only
 //     one goroutine writes to each connection.
-//   - The writer goroutine uses a bufio.Writer for automatic batching:
-//     multiple frames accumulate in the buffer and flush in a single
-//     conn.Write syscall when no more messages are immediately available.
+//   - The writer goroutine batches multiple envelopes into a single
+//     TagBatch frame and writes it directly to the conn in one Write
+//     syscall. No bufio layer — frames are already contiguous in memory.
 //   - Every conn.Write is bounded by transportWriteTimeout. On timeout or
 //     error the connection is closed and cleared, allowing reconnect on next send.
 //   - conn.Read uses a 64KB bufio.Reader. Read deadlines are refreshed every
@@ -40,7 +40,6 @@ package theatre
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -96,9 +95,44 @@ type Transport struct {
 	// before sending. If filter returns false, SendTo returns an error.
 	sendFilter atomic.Pointer[sendFilterFunc]
 
+	// dispatchWorkers controls parallel dispatch in readLoop. When > 0,
+	// ActorForward messages are dispatched to N worker goroutines (sharded
+	// by actor ref for ordering), overlapping I/O with handler processing.
+	// ActorForwardReply messages are always handled inline to minimize
+	// reply latency. Default 0 = all messages handled inline.
+	dispatchWorkers int
+
+	// sendLanes controls how many parallel send channels (and peerWriter
+	// goroutines) each peer gets. Workers shard messages across lanes by
+	// actor ref, reducing channel contention and parallelizing encoding.
+	// Default 0 or 1 = single channel (original behavior).
+	sendLanes int
+
 	done     chan struct{}
 	wg       sync.WaitGroup
 	stopOnce sync.Once
+}
+
+// SetDispatchWorkers configures the number of parallel dispatch workers
+// per readLoop. Must be called before Start. See Transport.dispatchWorkers.
+func (t *Transport) SetDispatchWorkers(n int) {
+	t.dispatchWorkers = n
+}
+
+// SetSendLanes configures the number of parallel send channels per peer.
+// Must be called before Start. See Transport.sendLanes.
+func (t *Transport) SetSendLanes(n int) {
+	if n < 1 {
+		n = 1
+	}
+	t.sendLanes = n
+}
+
+func (t *Transport) numLanes() int {
+	if t.sendLanes < 1 {
+		return 1
+	}
+	return t.sendLanes
 }
 
 // maxFramePayload is the upper bound on a single frame's payload
@@ -114,6 +148,7 @@ var readBufPool = sync.Pool{
 	},
 }
 
+
 type transportPeer struct {
 	hostID    string
 	address   string
@@ -121,14 +156,35 @@ type transportPeer struct {
 
 	mu       sync.Mutex // guards conn lifecycle (writeFrame compat)
 	conn     net.Conn
-	outbound bool         // true if we dialed (getOrConnect); false if they dialed (handleInbound)
-	encBuf   bytes.Buffer // encode buffer (writeFrame compat)
-	frameBuf []byte       // reusable frame buffer (writeFrame compat)
+	outbound bool   // true if we dialed (getOrConnect); false if they dialed (handleInbound)
+	frameBuf []byte // reusable frame buffer (writeFrame compat)
 
-	// Per-peer writer goroutine. SendTo pushes envelopes to sendCh;
-	// the peerWriter goroutine reads and writes them with zero contention.
-	sendCh    chan TransportEnvelope
-	writerOnce sync.Once
+	// Sharded send lanes. Workers shard messages across N sendChs to
+	// reduce channel contention. Each lane has a peerEncoder goroutine
+	// that encodes batches into frame bytes and sends them to mergeCh.
+	// A single peerFlusher goroutine reads from mergeCh and writes all
+	// accumulated frames in one conn.Write, preserving batch efficiency.
+	// With 1 lane, the encoder writes directly to conn (no mergeCh).
+	sendChs   []chan TransportEnvelope
+	mergeCh   chan []byte // encoded frames from encoders → flusher
+	frameFree chan []byte // channel-based free list for encoder↔flusher frame reuse
+	writersOnce sync.Once
+}
+
+func makeSendChs(n int) ([]chan TransportEnvelope, chan []byte, chan []byte) {
+	chs := make([]chan TransportEnvelope, n)
+	for i := range chs {
+		chs[i] = make(chan TransportEnvelope, peerSendBuffer)
+	}
+	var mergeCh, frameFree chan []byte
+	if n > 1 {
+		mergeCh = make(chan []byte, n*64)
+		// Channel-based free list: immune to GC clearing (unlike sync.Pool).
+		// Bounded at n*16 slots (~64 for 4 lanes). After warmup, encoders
+		// recycle frame slices with zero allocation.
+		frameFree = make(chan []byte, n*16)
+	}
+	return chs, mergeCh, frameFree
 }
 
 // NewTransport creates a transport that listens on listenAddr.
@@ -216,17 +272,59 @@ func (t *Transport) SendTo(hostID, address string, env TransportEnvelope) error 
 		return err
 	}
 
-	// Start writer goroutine (once per peer lifetime).
-	p.writerOnce.Do(func() {
-		t.wg.Add(1)
-		go t.peerWriter(p)
+	// Start encoder + flusher goroutines (once per peer lifetime).
+	p.writersOnce.Do(func() {
+		if p.mergeCh != nil {
+			// Multi-lane: N encoders feed a single flusher.
+			for i := range p.sendChs {
+				t.wg.Add(1)
+				go t.peerEncoder(p, i)
+			}
+			t.wg.Add(1)
+			go t.peerFlusher(p)
+		} else {
+			// Single lane: direct writer (encode + write in one goroutine).
+			t.wg.Add(1)
+			go t.peerWriter(p, 0)
+		}
 	})
 
+	// Select lane based on envelope content.
+	ch := p.sendChs[0]
+	if n := len(p.sendChs); n > 1 {
+		ch = p.sendChs[laneFor(env, n)]
+	}
+
+	// Fast path: non-blocking send when buffer has space (avoids
+	// the overhead of a two-case select on every message).
 	select {
-	case p.sendCh <- env:
+	case ch <- env:
+		return nil
+	default:
+	}
+	// Slow path: channel full or shutting down.
+	select {
+	case ch <- env:
 		return nil
 	case <-t.done:
 		return fmt.Errorf("transport: shutting down")
+	}
+}
+
+// laneFor returns the send lane index for a given envelope.
+// ActorForward messages are sharded by actor ref (preserves per-actor ordering).
+// ActorForwardReply messages are sharded by reply ID.
+// Other message types (rare) use lane 0.
+func laneFor(env TransportEnvelope, n int) int {
+	switch env.Tag {
+	case TagActorForward:
+		msg := env.Payload.(*ActorForward)
+		return int(refShard(Ref{Type: msg.ActorType, ID: msg.ActorID}) % uint32(n))
+	case TagActorForwardReply:
+		msg := env.Payload.(*ActorForwardReply)
+		return int(uint32(msg.ReplyID) % uint32(n))
+	default:
+		return 0
 	}
 }
 
@@ -291,10 +389,13 @@ func (t *Transport) handleInbound(conn net.Conn) {
 	if v, ok := t.peers.Load(remoteID); ok {
 		p = v.(*transportPeer)
 	} else {
+		chs, merge, free := makeSendChs(t.numLanes())
 		newP := &transportPeer{
-			hostID:  remoteID,
-			address: peerAddr,
-			sendCh:  make(chan TransportEnvelope, peerSendBuffer),
+			hostID:    remoteID,
+			address:   peerAddr,
+			sendChs:   chs,
+			mergeCh:   merge,
+			frameFree: free,
 		}
 		actual, _ := t.peers.LoadOrStore(remoteID, newP)
 		p = actual.(*transportPeer)
@@ -354,10 +455,13 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 	}
 
 	// Slow path: create peer entry if needed.
+	chs, merge, free := makeSendChs(t.numLanes())
 	newP := &transportPeer{
-		hostID:  hostID,
-		address: address,
-		sendCh:  make(chan TransportEnvelope, peerSendBuffer),
+		hostID:    hostID,
+		address:   address,
+		sendChs:   chs,
+		mergeCh:   merge,
+		frameFree: free,
 	}
 	actual, _ := t.peers.LoadOrStore(hostID, newP)
 	p := actual.(*transportPeer)
@@ -426,40 +530,220 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 
 // --- per-peer writer goroutine ---
 
-// peerWriter is the dedicated write goroutine for a single peer.
-// It reads envelopes from p.sendCh and writes them to the connection.
-// When multiple messages are available, they are combined into a single
-// TagBatch frame on the wire, reducing per-message framing overhead and
-// io.ReadFull calls on the read side. A bufio.Writer ensures the batch
-// frame and any single frames are flushed in one conn.Write syscall.
-// Since only this goroutine writes to the connection, there is zero
-// write contention.
-func (t *Transport) peerWriter(p *transportPeer) {
+// peerWriter is the combined encode+write goroutine for a single-lane peer.
+// Used when sendLanes <= 1 (no merge channel). Reads envelopes from
+// p.sendChs[0], encodes batches, and writes directly to the connection.
+func (t *Transport) peerWriter(p *transportPeer, lane int) {
 	defer t.wg.Done()
 
+	ch := p.sendChs[lane]
+
 	var (
-		encBuf   bytes.Buffer
-		frameBuf []byte
-		bw       *bufio.Writer
-		curConn  net.Conn
-		batch    [maxBatchSize]TransportEnvelope
+		frameBuf          []byte
+		curConn           net.Conn
+		batch             [maxBatchSize]TransportEnvelope
+		lastWriteDeadline int64
 	)
 
 	for {
-		// Block until the first message arrives.
 		select {
-		case batch[0] = <-p.sendCh:
-		case <-t.done:
-			return
+		case batch[0] = <-ch:
+		default:
+			select {
+			case batch[0] = <-ch:
+			case <-t.done:
+				return
+			}
 		}
 		n := 1
 
-		// Drain up to maxBatchSize-1 more messages (non-blocking).
 	drain:
 		for n < maxBatchSize {
 			select {
-			case batch[n] = <-p.sendCh:
+			case batch[n] = <-ch:
 				n++
+			default:
+				break drain
+			}
+		}
+
+		p.mu.Lock()
+		conn := p.conn
+		p.mu.Unlock()
+
+		if conn == nil {
+			recycleEnvelopes(batch[:n])
+			continue
+		}
+
+		if conn != curConn {
+			curConn = conn
+			lastWriteDeadline = 0
+		}
+
+		now := coarseNow.Load()
+		if now-lastWriteDeadline >= 2 {
+			conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
+			lastWriteDeadline = now
+		}
+
+		var writeErr error
+		if n == 1 {
+			writeErr = writeFrameTo(conn, &frameBuf, batch[0])
+		} else {
+			writeErr = writeBatchFrameTo(conn, &frameBuf, batch[:n])
+		}
+
+		if writeErr != nil {
+			t.closePeerConn(p, conn)
+			curConn = nil
+
+			p.mu.Lock()
+			conn = p.conn
+			p.mu.Unlock()
+			if conn == nil {
+				recycleEnvelopes(batch[:n])
+				continue
+			}
+			curConn = conn
+			lastWriteDeadline = 0
+			conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
+			lastWriteDeadline = coarseNow.Load()
+			if n == 1 {
+				writeErr = writeFrameTo(conn, &frameBuf, batch[0])
+			} else {
+				writeErr = writeBatchFrameTo(conn, &frameBuf, batch[:n])
+			}
+			if writeErr != nil {
+				t.closePeerConn(p, conn)
+				curConn = nil
+				recycleEnvelopes(batch[:n])
+				continue
+			}
+		}
+
+		recycleEnvelopes(batch[:n])
+	}
+}
+
+// peerEncoder is an encode-only goroutine for multi-lane peers. It reads
+// envelopes from p.sendChs[lane], encodes them into complete frame bytes,
+// and sends the frame to p.mergeCh for the flusher to write.
+//
+// Frame reuse: instead of allocating a new []byte per batch, the encoder
+// sends its frameBuf directly on mergeCh (ownership transfer) and gets a
+// replacement from p.frameFree (channel-based free list). The flusher
+// returns consumed frames to the free list. After warmup, zero allocations.
+func (t *Transport) peerEncoder(p *transportPeer, lane int) {
+	defer t.wg.Done()
+
+	ch := p.sendChs[lane]
+
+	// Get initial frameBuf from free list (or allocate).
+	frameBuf := getFrameBuf(p.frameFree)
+	var batch [maxBatchSize]TransportEnvelope
+
+	for {
+		select {
+		case batch[0] = <-ch:
+		default:
+			select {
+			case batch[0] = <-ch:
+			case <-t.done:
+				return
+			}
+		}
+		n := 1
+
+	drain:
+		for n < maxBatchSize {
+			select {
+			case batch[n] = <-ch:
+				n++
+			default:
+				break drain
+			}
+		}
+
+		var err error
+		if n == 1 {
+			err = buildFrame(&frameBuf, batch[0])
+		} else {
+			err = buildBatchFrame(&frameBuf, batch[:n])
+		}
+
+		recycleEnvelopes(batch[:n])
+
+		if err != nil {
+			continue
+		}
+
+		// Transfer ownership of frameBuf to the flusher. Get a new one.
+		select {
+		case p.mergeCh <- frameBuf:
+			frameBuf = getFrameBuf(p.frameFree)
+		case <-t.done:
+			return
+		}
+	}
+}
+
+// getFrameBuf returns a []byte from the free list, or allocates a new one.
+func getFrameBuf(free chan []byte) []byte {
+	select {
+	case buf := <-free:
+		return buf[:0]
+	default:
+		return make([]byte, 0, 4096)
+	}
+}
+
+// putFrameBuf returns a []byte to the free list (best-effort, drops if full).
+func putFrameBuf(free chan []byte, buf []byte) {
+	select {
+	case free <- buf:
+	default:
+	}
+}
+
+// peerFlusher is the single write goroutine for multi-lane peers. It reads
+// pre-encoded frames from p.mergeCh, accumulates them, and writes them to
+// the connection in one conn.Write call. This preserves batch efficiency
+// (few large writes) while allowing parallel encoding across lanes.
+func (t *Transport) peerFlusher(p *transportPeer) {
+	defer t.wg.Done()
+
+	var (
+		writeBuf          []byte
+		curConn           net.Conn
+		lastWriteDeadline int64
+	)
+
+	// Temporary slice to track frames for returning to the free list.
+	var pendingFrames [maxBatchSize][]byte
+
+	for {
+		// Block until the first encoded frame arrives.
+		var frame []byte
+		select {
+		case frame = <-p.mergeCh:
+		case <-t.done:
+			return
+		}
+		writeBuf = append(writeBuf[:0], frame...)
+		pendingFrames[0] = frame
+		nFrames := 1
+
+		// Drain more encoded frames (non-blocking).
+	drain:
+		for {
+			select {
+			case f := <-p.mergeCh:
+				writeBuf = append(writeBuf, f...)
+				if nFrames < len(pendingFrames) {
+					pendingFrames[nFrames] = f
+					nFrames++
+				}
 			default:
 				break drain
 			}
@@ -471,65 +755,57 @@ func (t *Transport) peerWriter(p *transportPeer) {
 		p.mu.Unlock()
 
 		if conn == nil {
-			recycleEnvelopes(batch[:n])
-			continue // dropped; next SendTo will reconnect
+			for i := range nFrames {
+				putFrameBuf(p.frameFree, pendingFrames[i])
+				pendingFrames[i] = nil
+			}
+			continue
 		}
 
-		// Reset writer on connection change.
 		if conn != curConn {
 			curConn = conn
-			bw = bufio.NewWriterSize(conn, 65536)
+			lastWriteDeadline = 0
 		}
 
-		conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
-
-		// Write batch (or single frame if only one message).
-		var writeErr error
-		if n == 1 {
-			writeErr = writeFrameTo(bw, &encBuf, &frameBuf, batch[0])
-		} else {
-			writeErr = writeBatchFrameTo(bw, &encBuf, &frameBuf, batch[:n])
+		now := coarseNow.Load()
+		if now-lastWriteDeadline >= 2 {
+			conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
+			lastWriteDeadline = now
 		}
+
+		_, writeErr := conn.Write(writeBuf)
 
 		if writeErr != nil {
 			t.closePeerConn(p, conn)
 			curConn = nil
 
-			// The connection may have been replaced by handleInbound
-			// (simultaneous connect tie-breaking). Retry once with
-			// the new connection if available.
 			p.mu.Lock()
 			conn = p.conn
 			p.mu.Unlock()
 			if conn == nil {
-				recycleEnvelopes(batch[:n])
+				for i := range nFrames {
+					putFrameBuf(p.frameFree, pendingFrames[i])
+					pendingFrames[i] = nil
+				}
 				continue
 			}
 			curConn = conn
-			bw = bufio.NewWriterSize(conn, 65536)
+			lastWriteDeadline = 0
 			conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
-			if n == 1 {
-				writeErr = writeFrameTo(bw, &encBuf, &frameBuf, batch[0])
-			} else {
-				writeErr = writeBatchFrameTo(bw, &encBuf, &frameBuf, batch[:n])
-			}
+			lastWriteDeadline = coarseNow.Load()
+
+			_, writeErr = conn.Write(writeBuf)
 			if writeErr != nil {
 				t.closePeerConn(p, conn)
 				curConn = nil
-				recycleEnvelopes(batch[:n])
-				continue
 			}
 		}
 
-		// Flush to network.
-		if curConn != nil {
-			if err := bw.Flush(); err != nil {
-				t.closePeerConn(p, conn)
-				curConn = nil
-			}
+		// Return all consumed frames to the free list.
+		for i := range nFrames {
+			putFrameBuf(p.frameFree, pendingFrames[i])
+			pendingFrames[i] = nil
 		}
-
-		recycleEnvelopes(batch[:n])
 	}
 }
 
@@ -559,6 +835,34 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 	// per connection) and is reused across iterations.
 	var batchBuf [maxBatchSize]TransportEnvelope
 
+	// Dispatch workers: when enabled, ActorForward messages are dispatched
+	// to parallel workers (sharded by actor ref for ordering), overlapping
+	// I/O reads with handler processing. ActorForwardReply and control
+	// messages are always handled inline to minimize reply latency.
+	nWorkers := t.dispatchWorkers
+	var dispatchChs []chan TransportEnvelope
+	if nWorkers > 0 {
+		var dwg sync.WaitGroup
+		dispatchChs = make([]chan TransportEnvelope, nWorkers)
+		for i := range nWorkers {
+			dispatchChs[i] = make(chan TransportEnvelope, 512)
+			dwg.Add(1)
+			go func(ch chan TransportEnvelope) {
+				defer dwg.Done()
+				for env := range ch {
+					t.handler(remoteID, env)
+					recyclePayload(env)
+				}
+			}(dispatchChs[i])
+		}
+		defer func() {
+			for _, ch := range dispatchChs {
+				close(ch)
+			}
+			dwg.Wait()
+		}()
+	}
+
 	for {
 		now := coarseNow.Load()
 		if now-lastDeadlineSet >= 10 {
@@ -586,13 +890,27 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 			return
 		}
 
-		if t.handler != nil {
-			if batchN > 0 {
-				for i := 0; i < batchN; i++ {
+		if t.handler == nil {
+			continue
+		}
+
+		if batchN > 0 {
+			for i := 0; i < batchN; i++ {
+				if dispatchChs != nil && batchBuf[i].Tag == TagActorForward {
+					msg := batchBuf[i].Payload.(*ActorForward)
+					shard := refShard(Ref{Type: msg.ActorType, ID: msg.ActorID}) % uint32(nWorkers)
+					dispatchChs[shard] <- batchBuf[i]
+				} else {
 					t.handler(remoteID, batchBuf[i])
 					recyclePayload(batchBuf[i])
-					batchBuf[i] = TransportEnvelope{}
 				}
+				batchBuf[i] = TransportEnvelope{}
+			}
+		} else {
+			if dispatchChs != nil && env.Tag == TagActorForward {
+				msg := env.Payload.(*ActorForward)
+				shard := refShard(Ref{Type: msg.ActorType, ID: msg.ActorID}) % uint32(nWorkers)
+				dispatchChs[shard] <- env
 			} else {
 				t.handler(remoteID, env)
 				recyclePayload(env)
@@ -603,56 +921,57 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 
 // --- framing ---
 
-// writeFrameTo encodes env into a single frame and writes it to w.
-// The caller provides the encode buffer and frame buffer, both of
-// which are reused across calls for the same connection.
-func writeFrameTo(w io.Writer, encBuf *bytes.Buffer, frameBuf *[]byte, env TransportEnvelope) error {
-	encBuf.Reset()
-	if err := encodePayload(encBuf, env); err != nil {
+// buildFrame encodes env into a single frame in *frameBuf (no I/O).
+// Encodes directly into frameBuf — no intermediate bytes.Buffer for the
+// fast path (ActorForward/Reply with string body).
+func buildFrame(frameBuf *[]byte, env TransportEnvelope) error {
+	buf := (*frameBuf)[:0]
+	buf = append(buf, 0, 0, 0, 0, env.Tag) // 4-byte length placeholder + tag
+
+	var err error
+	buf, err = appendEncodedPayload(buf, env)
+	if err != nil {
 		return fmt.Errorf("transport encode: %w", err)
 	}
-	payloadBytes := encBuf.Bytes()
 
-	frameLen := 1 + len(payloadBytes)
-	needed := 4 + frameLen
-	buf := *frameBuf
-	if cap(buf) < needed {
-		buf = make([]byte, needed)
-	} else {
-		buf = buf[:needed]
-	}
-	binary.BigEndian.PutUint32(buf[:4], uint32(frameLen))
-	buf[4] = env.Tag
-	copy(buf[5:], payloadBytes)
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
 	*frameBuf = buf
+	return nil
+}
 
-	_, err := w.Write(buf)
+// buildBatchFrame encodes multiple envelopes into a single TagBatch frame
+// in *frameBuf (no I/O). Encodes directly — no intermediate bytes.Buffer.
+func buildBatchFrame(frameBuf *[]byte, envs []TransportEnvelope) error {
+	buf := (*frameBuf)[:0]
+	buf = append(buf, 0, 0, 0, 0, TagBatch) // 4-byte length placeholder + batch tag
+
+	var err error
+	buf, err = appendBatchEncodedPayload(buf, envs)
+	if err != nil {
+		return fmt.Errorf("transport batch encode: %w", err)
+	}
+
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
+	*frameBuf = buf
+	return nil
+}
+
+// writeFrameTo encodes env into a single frame and writes it to w.
+func writeFrameTo(w io.Writer, frameBuf *[]byte, env TransportEnvelope) error {
+	if err := buildFrame(frameBuf, env); err != nil {
+		return err
+	}
+	_, err := w.Write(*frameBuf)
 	return err
 }
 
 // writeBatchFrameTo encodes multiple envelopes into a single TagBatch frame
-// and writes it to w. Same buffer reuse pattern as writeFrameTo.
-func writeBatchFrameTo(w io.Writer, encBuf *bytes.Buffer, frameBuf *[]byte, envs []TransportEnvelope) error {
-	encBuf.Reset()
-	if err := encodeBatchPayload(encBuf, envs); err != nil {
-		return fmt.Errorf("transport batch encode: %w", err)
+// and writes it to w.
+func writeBatchFrameTo(w io.Writer, frameBuf *[]byte, envs []TransportEnvelope) error {
+	if err := buildBatchFrame(frameBuf, envs); err != nil {
+		return err
 	}
-	batchBytes := encBuf.Bytes()
-
-	frameLen := 1 + len(batchBytes)
-	needed := 4 + frameLen
-	buf := *frameBuf
-	if cap(buf) < needed {
-		buf = make([]byte, needed)
-	} else {
-		buf = buf[:needed]
-	}
-	binary.BigEndian.PutUint32(buf[:4], uint32(frameLen))
-	buf[4] = TagBatch
-	copy(buf[5:], batchBytes)
-	*frameBuf = buf
-
-	_, err := w.Write(buf)
+	_, err := w.Write(*frameBuf)
 	return err
 }
 
@@ -673,7 +992,7 @@ func (t *Transport) writeFrame(p *transportPeer, env TransportEnvelope) error {
 	conn := p.conn
 
 	conn.SetWriteDeadline(time.Now().Add(transportWriteTimeout))
-	if err := writeFrameTo(conn, &p.encBuf, &p.frameBuf, env); err != nil {
+	if err := writeFrameTo(conn, &p.frameBuf, env); err != nil {
 		conn.Close()
 		if p.conn == conn {
 			p.conn = nil

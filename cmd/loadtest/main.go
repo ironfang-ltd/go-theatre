@@ -115,6 +115,7 @@ func main() {
 	sendpct := flag.Int("sendpct", 70, "percentage of Send vs Request (0-100)")
 	mode := flag.String("mode", "mixed", "worker mode: mixed (random actors via all hosts), forward (all workers enter host-1), local (workers only target local actors)")
 	dsn := flag.String("dsn", "", "Postgres connection string (empty = in-memory ring mode)")
+	lanes := flag.Int("lanes", 4, "send lanes per peer (0=1, parallelizes encoding)")
 	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "write allocation profile to file")
 	flag.Parse()
@@ -207,6 +208,9 @@ func main() {
 	fmt.Printf("  duration: %s\n", *duration)
 	fmt.Printf("  GC:       %s\n", gcInfo)
 	fmt.Printf("  inbox:    actor=%d  host=%d\n", p.actorInbox, p.hostInbox)
+	if *hostCount > 1 {
+		fmt.Printf("  lanes:    %d per peer\n", *lanes)
+	}
 	fmt.Println()
 
 	var inits, shutdowns atomic.Int64
@@ -222,7 +226,7 @@ func main() {
 		hosts, extraCleanup = setupPostgresCluster(p, *hostCount, *dsn, &inits, &shutdowns)
 	} else {
 		// Ring-only mode — transport + hash ring, no DB.
-		hosts, extraCleanup = setupRingCluster(p, *hostCount, &inits, &shutdowns)
+		hosts, extraCleanup = setupRingCluster(p, *hostCount, *lanes, &inits, &shutdowns)
 	}
 
 	for _, he := range hosts {
@@ -331,12 +335,12 @@ func main() {
 		}
 	}
 
-	// Progress reporting.
+	// Progress reporting: compact log lines during run for pattern watching.
+	tracker := newRuntimeTracker(start, hosts, &totalSends, &totalRequests)
 	ticker := time.NewTicker(5 * time.Second)
 	go func() {
 		for range ticker.C {
-			elapsed := time.Since(start).Truncate(time.Second)
-			printProgress(hosts, elapsed, &inits, &shutdowns)
+			tracker.logLine()
 		}
 	}()
 
@@ -374,6 +378,7 @@ func main() {
 	fmt.Printf("  Aggregate RPS:   %.0f\n\n", float64(totalOps)/elapsed.Seconds())
 
 	printProgress(hosts, elapsed.Truncate(time.Second), &inits, &shutdowns)
+	tracker.printSummary()
 }
 
 // setupStandalone creates a single standalone host (no transport, no cluster).
@@ -387,7 +392,7 @@ func setupStandalone(p profile, inits, shutdowns *atomic.Int64) []*hostEntry {
 
 // setupRingCluster creates N hosts with TCP transport and a shared hash ring
 // for deterministic actor placement. No Postgres database is used.
-func setupRingCluster(p profile, n int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
+func setupRingCluster(p profile, n int, lanes int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
 	hosts := make([]*hostEntry, n)
 	transports := make([]*theatre.Transport, n)
 	hostIDs := make([]string, n)
@@ -408,6 +413,8 @@ func setupRingCluster(p profile, n int, inits, shutdowns *atomic.Int64) ([]*host
 			fmt.Fprintf(os.Stderr, "transport error: %v\n", err)
 			os.Exit(1)
 		}
+		t.SetSendLanes(lanes)
+		t.SetDispatchWorkers(lanes)
 		t.Start()
 		transports[i] = t
 	}
@@ -509,7 +516,7 @@ func printProgress(hosts []*hostEntry, elapsed time.Duration, inits, shutdowns *
 		"HOST", "SENT", "RECV", "DEAD", "REQ", "TIMEOUT", "ACTV_TOT", "ACTORS", "RPS")
 	for _, he := range hosts {
 		s := he.host.Metrics().Snapshot()
-		ops := s["messages_sent"] + s["requests_total"]
+		ops := s["messages_received"]
 		rps := float64(0)
 		if secs > 0 {
 			rps = float64(ops) / secs
@@ -527,4 +534,171 @@ func printProgress(hosts []*hostEntry, elapsed time.Duration, inits, shutdowns *
 		)
 	}
 	fmt.Println()
+}
+
+// runtimeTracker computes deltas for CPU%, alloc rate, and GC stats between
+// intervals. Prints compact log lines during the run and a detailed summary
+// at the end with min/max/avg CPU.
+type runtimeTracker struct {
+	startTime  time.Time
+	totalSends *atomic.Int64
+	totalReqs  *atomic.Int64
+	hosts      []*hostEntry
+
+	prevCPU   time.Duration
+	prevWall  time.Time
+	prevAlloc uint64
+	prevGC    uint32
+	prevOps   int64
+
+	minCPU     float64
+	maxCPU     float64
+	sumCPU     float64
+	cpuSamples int
+
+	peakHeapMiB float64
+	peakAlloc   float64
+	totalGCPause time.Duration
+}
+
+func newRuntimeTracker(start time.Time, hosts []*hostEntry, sends, reqs *atomic.Int64) *runtimeTracker {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return &runtimeTracker{
+		startTime:  start,
+		totalSends: sends,
+		totalReqs:  reqs,
+		hosts:      hosts,
+		prevCPU:    processCPUTime(),
+		prevWall:   time.Now(),
+		prevAlloc:  ms.TotalAlloc,
+		prevGC:     ms.NumGC,
+		minCPU:     100.0,
+	}
+}
+
+// sample reads current runtime stats and returns computed values.
+type runtimeSample struct {
+	elapsed   time.Duration
+	cpuPct    float64
+	heapMiB   float64
+	allocRate float64 // MiB/s
+	gcDelta   uint32
+	lastPause time.Duration
+	goroutines int
+	rps       float64 // interval RPS
+}
+
+func (t *runtimeTracker) sample() runtimeSample {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	now := time.Now()
+	cpuNow := processCPUTime()
+	elapsed := now.Sub(t.startTime).Truncate(time.Second)
+
+	wallDelta := now.Sub(t.prevWall).Seconds()
+	cpuDelta := cpuNow - t.prevCPU
+	allocDelta := ms.TotalAlloc - t.prevAlloc
+	gcDelta := ms.NumGC - t.prevGC
+
+	// CPU% relative to total machine capacity (0-100%).
+	cpuPct := 0.0
+	numCPU := float64(runtime.NumCPU())
+	if wallDelta > 0 && numCPU > 0 {
+		cpuPct = cpuDelta.Seconds() / wallDelta / numCPU * 100
+	}
+
+	// Alloc rate.
+	allocRate := 0.0
+	if wallDelta > 0 {
+		allocRate = float64(allocDelta) / wallDelta / (1024 * 1024)
+	}
+
+	heapMiB := float64(ms.HeapInuse) / (1024 * 1024)
+
+	lastPause := time.Duration(0)
+	if ms.NumGC > 0 {
+		lastPause = time.Duration(ms.PauseNs[(ms.NumGC+255)%256])
+	}
+
+	// Interval RPS from aggregate received messages.
+	var totalRecv int64
+	for _, he := range t.hosts {
+		s := he.host.Metrics().Snapshot()
+		totalRecv += s["messages_received"]
+	}
+	rps := 0.0
+	if wallDelta > 0 {
+		rps = float64(totalRecv-t.prevOps) / wallDelta
+	}
+
+	// Track min/max/avg CPU.
+	if t.cpuSamples == 0 || cpuPct < t.minCPU {
+		t.minCPU = cpuPct
+	}
+	if cpuPct > t.maxCPU {
+		t.maxCPU = cpuPct
+	}
+	t.sumCPU += cpuPct
+	t.cpuSamples++
+
+	if heapMiB > t.peakHeapMiB {
+		t.peakHeapMiB = heapMiB
+	}
+	if allocRate > t.peakAlloc {
+		t.peakAlloc = allocRate
+	}
+
+	// Accumulate GC pause time.
+	for i := t.prevGC; i < ms.NumGC; i++ {
+		t.totalGCPause += time.Duration(ms.PauseNs[(i+256)%256])
+	}
+
+	// Update previous state.
+	t.prevCPU = cpuNow
+	t.prevWall = now
+	t.prevAlloc = ms.TotalAlloc
+	t.prevGC = ms.NumGC
+	t.prevOps = totalRecv
+
+	return runtimeSample{
+		elapsed:    elapsed,
+		cpuPct:     cpuPct,
+		heapMiB:    heapMiB,
+		allocRate:  allocRate,
+		gcDelta:    gcDelta,
+		lastPause:  lastPause,
+		goroutines: runtime.NumGoroutine(),
+		rps:        rps,
+	}
+}
+
+// logLine prints a compact one-line status for pattern watching.
+func (t *runtimeTracker) logLine() {
+	s := t.sample()
+	fmt.Printf("[%s]  RPS: %7.0f  CPU: %5.1f%%  Heap: %5.0fMiB  Alloc: %5.0fMiB/s  GC: +%-3d (%s)  G: %d\n",
+		s.elapsed, s.rps, s.cpuPct, s.heapMiB, s.allocRate, s.gcDelta,
+		s.lastPause.Round(time.Microsecond), s.goroutines)
+}
+
+// printSummary prints detailed runtime stats for the final report.
+func (t *runtimeTracker) printSummary() {
+	s := t.sample()
+
+	avgCPU := 0.0
+	if t.cpuSamples > 0 {
+		avgCPU = t.sumCPU / float64(t.cpuSamples)
+	}
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	fmt.Printf("  Runtime:\n")
+	fmt.Printf("    CPU:          avg %.1f%%  min %.1f%%  max %.1f%%\n", avgCPU, t.minCPU, t.maxCPU)
+	fmt.Printf("    Heap:         %.0f MiB (peak %.0f MiB)\n", s.heapMiB, t.peakHeapMiB)
+	fmt.Printf("    Total Alloc:  %.1f GiB\n", float64(ms.TotalAlloc)/(1024*1024*1024))
+	fmt.Printf("    Alloc Rate:   %.0f MiB/s (peak %.0f MiB/s)\n", s.allocRate, t.peakAlloc)
+	fmt.Printf("    GC Cycles:    %d  Total Pause: %s\n", ms.NumGC, t.totalGCPause.Round(time.Millisecond))
+	fmt.Printf("    Goroutines:   %d\n", s.goroutines)
 }

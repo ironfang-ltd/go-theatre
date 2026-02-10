@@ -89,6 +89,7 @@ func (m *Host) SetTransport(t *Transport) {
 // Must be called before Start.
 func (m *Host) SetCluster(c *Cluster) {
 	m.cluster = c
+	m.localHostID = c.LocalHostID()
 	m.placementCache = newPlacementCache(int64(m.config.placementTTL.Seconds()))
 }
 
@@ -150,7 +151,7 @@ func (m *Host) routeMessage(msg OutboxMessage) {
 		if entry, ok := m.placementCache.Get(ref); ok {
 			m.metrics.PlacementCacheHits.Add(1)
 			if m.isEntryLive(entry) {
-				if entry.HostID == m.cluster.LocalHostID() {
+				if entry.HostID == m.localHostID {
 					// Cache says local but actor gone → evict, fall through.
 					m.placementCache.Evict(ref)
 				} else {
@@ -228,7 +229,7 @@ func (m *Host) forwardToRemote(hostID, address string, ref Ref, msg OutboxMessag
 	fwd.ActorID = ref.ID
 	fwd.Body = msg.Body
 	fwd.ReplyID = msg.ReplyID
-	fwd.SenderHostID = m.cluster.LocalHostID()
+	fwd.SenderHostID = m.localHostID
 	env := TransportEnvelope{Tag: TagActorForward, Payload: fwd}
 	if msg.ReplyID != 0 {
 		m.storePendingRemote(msg.ReplyID, ref, msg)
@@ -254,7 +255,7 @@ func (m *Host) resolveAndForward(ref Ref, msg OutboxMessage) {
 	if owner != nil {
 		m.placementCache.Put(ref, *owner)
 
-		if owner.HostID == m.cluster.LocalHostID() {
+		if owner.HostID == m.localHostID {
 			// Owner is us but actor doesn't exist locally.
 			// Re-activate without re-claiming (we already own it).
 			m.activateAndDeliver(ref, false, msg)
@@ -281,20 +282,30 @@ func (m *Host) resolveAndForward(ref Ref, msg OutboxMessage) {
 		return
 	}
 
-	if preferredHost == m.cluster.LocalHostID() {
+	if preferredHost == m.localHostID {
 		// We're the preferred host. Claim and activate.
 		m.activateAndDeliver(ref, true, msg)
 	} else {
 		// Forward to the preferred host (they will claim).
-		address := m.getHostAddress(preferredHost)
-		if address == "" {
+		h, ok := m.cluster.HostLookup(preferredHost)
+		if !ok || h.Address == "" {
 			slog.Warn("preferred host address not found", "host", preferredHost)
 			m.handleDeadLetter(msg)
 			return
 		}
-		if err := m.forwardToRemote(preferredHost, address, ref, msg); err != nil {
+		if err := m.forwardToRemote(preferredHost, h.Address, ref, msg); err != nil {
 			slog.Error("forward to preferred host failed", "ref", ref, "error", err)
 			m.handleDeadLetter(msg)
+			return
+		}
+		// Populate placement cache so subsequent Send()/Request() calls
+		// use the fast path (direct forwardToRemote, bypassing outbox).
+		if m.placementCache != nil {
+			m.placementCache.Put(ref, PlacementEntry{
+				HostID:  preferredHost,
+				Address: h.Address,
+				Epoch:   h.Epoch,
+			})
 		}
 	}
 }
@@ -414,6 +425,7 @@ func (m *Host) handleActorForward(fromHostID string, msg *ActorForward) {
 		senderHostID:  fromHostID,
 		senderAddress: senderAddress,
 	})
+	m.metrics.MessagesReceived.Add(1)
 }
 
 func (m *Host) handleActorForwardReply(msg *ActorForwardReply) {
@@ -455,7 +467,7 @@ func (m *Host) sendNotHere(toHostID string, fwd *ActorForward) {
 		Payload: &NotHere{
 			ActorType: fwd.ActorType,
 			ActorID:   fwd.ActorID,
-			HostID:    m.cluster.LocalHostID(),
+			HostID:    m.localHostID,
 			Epoch:     m.cluster.LocalEpoch(),
 		},
 	}
@@ -475,7 +487,7 @@ func (m *Host) sendHostFrozen(toHostID string, fwd *ActorForward) {
 			ActorType: fwd.ActorType,
 			ActorID:   fwd.ActorID,
 			ReplyID:   fwd.ReplyID,
-			HostID:    m.cluster.LocalHostID(),
+			HostID:    m.localHostID,
 			Epoch:     m.cluster.LocalEpoch(),
 		},
 	}
@@ -552,7 +564,7 @@ func (m *Host) retryPendingForActor(ref Ref) {
 			if m.placementCache != nil {
 				m.placementCache.Put(ref, *owner)
 			}
-			if owner.HostID == m.cluster.LocalHostID() {
+			if owner.HostID == m.localHostID {
 				m.deliverLocal(pr.msg)
 			} else {
 				if err := m.forwardToRemote(owner.HostID, owner.Address, ref, pr.msg); err != nil {

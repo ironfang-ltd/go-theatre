@@ -167,6 +167,52 @@ func RegisterGobType(value interface{}) {
 
 // --- binary codec: encode ---
 
+// Fast-path helpers for ActorForward and ActorForwardReply with string body.
+// These encode directly into a pre-sized byte slice using a single buf.Write
+// call, eliminating 10+ individual putStr/putI64/putBody calls per message.
+
+func actorForwardStrSize(msg *ActorForward, bodyStr string) int {
+	return 2 + len(msg.ActorType) + 2 + len(msg.ActorID) + 8 + 2 + len(msg.SenderHostID) + 1 + 4 + len(bodyStr)
+}
+
+func encodeActorForwardStr(b []byte, off int, msg *ActorForward, bodyStr string) int {
+	binary.BigEndian.PutUint16(b[off:], uint16(len(msg.ActorType)))
+	off += 2
+	off += copy(b[off:], msg.ActorType)
+	binary.BigEndian.PutUint16(b[off:], uint16(len(msg.ActorID)))
+	off += 2
+	off += copy(b[off:], msg.ActorID)
+	binary.BigEndian.PutUint64(b[off:], uint64(msg.ReplyID))
+	off += 8
+	binary.BigEndian.PutUint16(b[off:], uint16(len(msg.SenderHostID)))
+	off += 2
+	off += copy(b[off:], msg.SenderHostID)
+	b[off] = bodyString
+	off++
+	binary.BigEndian.PutUint32(b[off:], uint32(len(bodyStr)))
+	off += 4
+	off += copy(b[off:], bodyStr)
+	return off
+}
+
+func actorForwardReplyStrSize(msg *ActorForwardReply, bodyStr string) int {
+	return 8 + 2 + len(msg.Error) + 1 + 4 + len(bodyStr)
+}
+
+func encodeActorForwardReplyStr(b []byte, off int, msg *ActorForwardReply, bodyStr string) int {
+	binary.BigEndian.PutUint64(b[off:], uint64(msg.ReplyID))
+	off += 8
+	binary.BigEndian.PutUint16(b[off:], uint16(len(msg.Error)))
+	off += 2
+	off += copy(b[off:], msg.Error)
+	b[off] = bodyString
+	off++
+	binary.BigEndian.PutUint32(b[off:], uint32(len(bodyStr)))
+	off += 4
+	off += copy(b[off:], bodyStr)
+	return off
+}
+
 // encodePayload writes the binary-encoded payload fields into buf.
 func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 	switch env.Tag {
@@ -179,6 +225,15 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 			msg = &v
 		default:
 			return fmt.Errorf("expected ActorForward, got %T", env.Payload)
+		}
+		// Fast path: string body (most common in production).
+		if bodyStr, ok := msg.Body.(string); ok {
+			n := actorForwardStrSize(msg, bodyStr)
+			buf.Grow(n)
+			b := buf.AvailableBuffer()[:n]
+			encodeActorForwardStr(b, 0, msg, bodyStr)
+			buf.Write(b)
+			return nil
 		}
 		putStr(buf, msg.ActorType)
 		putStr(buf, msg.ActorID)
@@ -195,6 +250,15 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 			msg = &v
 		default:
 			return fmt.Errorf("expected ActorForwardReply, got %T", env.Payload)
+		}
+		// Fast path: string body.
+		if bodyStr, ok := msg.Body.(string); ok {
+			n := actorForwardReplyStrSize(msg, bodyStr)
+			buf.Grow(n)
+			b := buf.AvailableBuffer()[:n]
+			encodeActorForwardReplyStr(b, 0, msg, bodyStr)
+			buf.Write(b)
+			return nil
 		}
 		putI64(buf, msg.ReplyID)
 		putStr(buf, msg.Error)
@@ -303,19 +367,157 @@ func putBody(buf *bytes.Buffer, body interface{}) error {
 	return nil
 }
 
+// --- direct append codec ---
+//
+// appendEncodedPayload and appendBatchEncodedPayload encode directly into
+// a caller-provided []byte, eliminating the intermediate bytes.Buffer and
+// the copy into frameBuf that the original encodePayload path requires.
+// For the two highest-volume types (ActorForward/Reply with string body),
+// this is a single append + in-place encode. Rare types fall back to a
+// stack-local bytes.Buffer.
+
+// appendEncodedPayload appends the binary-encoded payload of env to dst.
+func appendEncodedPayload(dst []byte, env TransportEnvelope) ([]byte, error) {
+	switch env.Tag {
+	case TagActorForward:
+		msg, ok := env.Payload.(*ActorForward)
+		if !ok {
+			if v, ok2 := env.Payload.(ActorForward); ok2 {
+				msg = &v
+			} else {
+				return dst, fmt.Errorf("expected ActorForward, got %T", env.Payload)
+			}
+		}
+		if bodyStr, ok := msg.Body.(string); ok {
+			n := actorForwardStrSize(msg, bodyStr)
+			off := len(dst)
+			dst = append(dst, make([]byte, n)...)
+			encodeActorForwardStr(dst, off, msg, bodyStr)
+			return dst, nil
+		}
+	case TagActorForwardReply:
+		msg, ok := env.Payload.(*ActorForwardReply)
+		if !ok {
+			if v, ok2 := env.Payload.(ActorForwardReply); ok2 {
+				msg = &v
+			} else {
+				return dst, fmt.Errorf("expected ActorForwardReply, got %T", env.Payload)
+			}
+		}
+		if bodyStr, ok := msg.Body.(string); ok {
+			n := actorForwardReplyStrSize(msg, bodyStr)
+			off := len(dst)
+			dst = append(dst, make([]byte, n)...)
+			encodeActorForwardReplyStr(dst, off, msg, bodyStr)
+			return dst, nil
+		}
+	case TagPing, TagPong:
+		return dst, nil
+	}
+	// Slow path: rare types or non-string body. Use bytes.Buffer.
+	var encBuf bytes.Buffer
+	if err := encodePayload(&encBuf, env); err != nil {
+		return dst, err
+	}
+	return append(dst, encBuf.Bytes()...), nil
+}
+
+// appendBatchEncodedPayload appends a batch of sub-messages to dst using
+// the batch wire format: [2-byte count][tag+len+payload × N].
+func appendBatchEncodedPayload(dst []byte, envs []TransportEnvelope) ([]byte, error) {
+	dst = binary.BigEndian.AppendUint16(dst, uint16(len(envs)))
+	for _, env := range envs {
+		// Fast path: ActorForward with string body.
+		if env.Tag == TagActorForward {
+			if msg, ok := env.Payload.(*ActorForward); ok {
+				if bodyStr, ok := msg.Body.(string); ok {
+					subLen := actorForwardStrSize(msg, bodyStr)
+					dst = append(dst, TagActorForward)
+					dst = binary.BigEndian.AppendUint32(dst, uint32(subLen))
+					off := len(dst)
+					dst = append(dst, make([]byte, subLen)...)
+					encodeActorForwardStr(dst, off, msg, bodyStr)
+					continue
+				}
+			}
+		}
+		// Fast path: ActorForwardReply with string body.
+		if env.Tag == TagActorForwardReply {
+			if msg, ok := env.Payload.(*ActorForwardReply); ok {
+				if bodyStr, ok := msg.Body.(string); ok {
+					subLen := actorForwardReplyStrSize(msg, bodyStr)
+					dst = append(dst, TagActorForwardReply)
+					dst = binary.BigEndian.AppendUint32(dst, uint32(subLen))
+					off := len(dst)
+					dst = append(dst, make([]byte, subLen)...)
+					encodeActorForwardReplyStr(dst, off, msg, bodyStr)
+					continue
+				}
+			}
+		}
+		// Slow path: encode into temp buffer, then append.
+		dst = append(dst, env.Tag)
+		lenPos := len(dst)
+		dst = append(dst, 0, 0, 0, 0) // placeholder
+		var encBuf bytes.Buffer
+		if err := encodePayload(&encBuf, env); err != nil {
+			return dst, err
+		}
+		dst = append(dst, encBuf.Bytes()...)
+		binary.BigEndian.PutUint32(dst[lenPos:], uint32(len(dst)-lenPos-4))
+	}
+	return dst, nil
+}
+
 // --- batch codec ---
 
 // encodeBatchPayload writes N sub-messages into buf using the batch wire format:
 //
 //	[2-byte count]
 //	  [1-byte sub-tag][4-byte sub-payload-len][sub-payload-bytes]  × count
+//
+// For the two highest-volume message types (ActorForward and ActorForwardReply
+// with string body), a fast path writes tag + length + payload in a single
+// buf.Write call, eliminating per-field writes and backpatching.
 func encodeBatchPayload(buf *bytes.Buffer, envs []TransportEnvelope) error {
 	var tmp [2]byte
 	binary.BigEndian.PutUint16(tmp[:], uint16(len(envs)))
 	buf.Write(tmp[:])
 	for _, env := range envs {
+		// Fast path: ActorForward with string body.
+		if env.Tag == TagActorForward {
+			if msg, ok := env.Payload.(*ActorForward); ok {
+				if bodyStr, ok := msg.Body.(string); ok {
+					subLen := actorForwardStrSize(msg, bodyStr)
+					n := 1 + 4 + subLen
+					buf.Grow(n)
+					b := buf.AvailableBuffer()[:n]
+					b[0] = TagActorForward
+					binary.BigEndian.PutUint32(b[1:], uint32(subLen))
+					encodeActorForwardStr(b, 5, msg, bodyStr)
+					buf.Write(b)
+					continue
+				}
+			}
+		}
+		// Fast path: ActorForwardReply with string body.
+		if env.Tag == TagActorForwardReply {
+			if msg, ok := env.Payload.(*ActorForwardReply); ok {
+				if bodyStr, ok := msg.Body.(string); ok {
+					subLen := actorForwardReplyStrSize(msg, bodyStr)
+					n := 1 + 4 + subLen
+					buf.Grow(n)
+					b := buf.AvailableBuffer()[:n]
+					b[0] = TagActorForwardReply
+					binary.BigEndian.PutUint32(b[1:], uint32(subLen))
+					encodeActorForwardReplyStr(b, 5, msg, bodyStr)
+					buf.Write(b)
+					continue
+				}
+			}
+		}
+		// Generic fallback with backpatch.
 		buf.WriteByte(env.Tag)
-		// Reserve 4 bytes for sub-payload length.
 		lenPos := buf.Len()
 		var placeholder [4]byte
 		buf.Write(placeholder[:])
