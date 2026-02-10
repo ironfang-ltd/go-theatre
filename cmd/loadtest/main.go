@@ -116,9 +116,16 @@ func main() {
 	mode := flag.String("mode", "mixed", "worker mode: mixed (random actors via all hosts), forward (all workers enter host-1), local (workers only target local actors)")
 	dsn := flag.String("dsn", "", "Postgres connection string (empty = in-memory ring mode)")
 	lanes := flag.Int("lanes", 4, "send lanes per peer (0=1, parallelizes encoding)")
+	multiconn := flag.Int("multiconn", 0, "connections per peer (0=single conn, >0=one conn per lane)")
 	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "write allocation profile to file")
+	contention := flag.Bool("contention", false, "enable block+mutex contention profiling via admin pprof endpoints")
 	flag.Parse()
+
+	if *contention {
+		runtime.SetBlockProfileRate(1000)    // record blocking events >= 1μs
+		runtime.SetMutexProfileFraction(100) // sample 1/100 mutex contentions
+	}
 
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
@@ -210,6 +217,9 @@ func main() {
 	fmt.Printf("  inbox:    actor=%d  host=%d\n", p.actorInbox, p.hostInbox)
 	if *hostCount > 1 {
 		fmt.Printf("  lanes:    %d per peer\n", *lanes)
+		if *multiconn > 0 {
+			fmt.Printf("  multiconn: %d conns per peer\n", *multiconn)
+		}
 	}
 	fmt.Println()
 
@@ -226,7 +236,7 @@ func main() {
 		hosts, extraCleanup = setupPostgresCluster(p, *hostCount, *dsn, &inits, &shutdowns)
 	} else {
 		// Ring-only mode — transport + hash ring, no DB.
-		hosts, extraCleanup = setupRingCluster(p, *hostCount, *lanes, &inits, &shutdowns)
+		hosts, extraCleanup = setupRingCluster(p, *hostCount, *lanes, *multiconn, &inits, &shutdowns)
 	}
 
 	for _, he := range hosts {
@@ -392,7 +402,7 @@ func setupStandalone(p profile, inits, shutdowns *atomic.Int64) []*hostEntry {
 
 // setupRingCluster creates N hosts with TCP transport and a shared hash ring
 // for deterministic actor placement. No Postgres database is used.
-func setupRingCluster(p profile, n int, lanes int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
+func setupRingCluster(p profile, n int, lanes int, multiConn int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
 	hosts := make([]*hostEntry, n)
 	transports := make([]*theatre.Transport, n)
 	hostIDs := make([]string, n)
@@ -414,6 +424,9 @@ func setupRingCluster(p profile, n int, lanes int, inits, shutdowns *atomic.Int6
 			os.Exit(1)
 		}
 		t.SetSendLanes(lanes)
+		if multiConn > 0 {
+			t.SetMultiConn(multiConn)
+		}
 		t.SetDispatchWorkers(lanes)
 		t.Start()
 		transports[i] = t

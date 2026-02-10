@@ -108,6 +108,12 @@ type Transport struct {
 	// Default 0 or 1 = single channel (original behavior).
 	sendLanes int
 
+	// multiConn controls multi-connection mode. When > 0, each send
+	// lane gets its own TCP connection, eliminating the mergeCh/flusher
+	// bottleneck. Each peerWriter lazily dials its own lane connection.
+	// Default 0 = single connection per peer (original behavior).
+	multiConn int
+
 	done     chan struct{}
 	wg       sync.WaitGroup
 	stopOnce sync.Once
@@ -126,6 +132,12 @@ func (t *Transport) SetSendLanes(n int) {
 		n = 1
 	}
 	t.sendLanes = n
+}
+
+// SetMultiConn enables multi-connection mode where each send lane gets
+// its own TCP connection. Must be called before Start.
+func (t *Transport) SetMultiConn(n int) {
+	t.multiConn = n
 }
 
 func (t *Transport) numLanes() int {
@@ -149,6 +161,12 @@ var readBufPool = sync.Pool{
 }
 
 
+// laneConn holds a per-lane TCP connection in multi-conn mode.
+type laneConn struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
 type transportPeer struct {
 	hostID    string
 	address   string
@@ -168,13 +186,18 @@ type transportPeer struct {
 	sendChs   []chan TransportEnvelope
 	mergeCh   chan []byte // encoded frames from encoders → flusher
 	frameFree chan []byte // channel-based free list for encoder↔flusher frame reuse
+	laneConns    []laneConn // per-lane connections (multi-conn mode)
+	inboundConns []net.Conn // accepted connections (multi-conn mode, guarded by mu)
 	writersOnce sync.Once
 }
 
-func makeSendChs(n int) ([]chan TransportEnvelope, chan []byte, chan []byte) {
+func makeSendChs(n int, multiConn bool) ([]chan TransportEnvelope, chan []byte, chan []byte, []laneConn) {
 	chs := make([]chan TransportEnvelope, n)
 	for i := range chs {
 		chs[i] = make(chan TransportEnvelope, peerSendBuffer)
+	}
+	if multiConn {
+		return chs, nil, nil, make([]laneConn, n)
 	}
 	var mergeCh, frameFree chan []byte
 	if n > 1 {
@@ -184,7 +207,7 @@ func makeSendChs(n int) ([]chan TransportEnvelope, chan []byte, chan []byte) {
 		// recycle frame slices with zero allocation.
 		frameFree = make(chan []byte, n*16)
 	}
-	return chs, mergeCh, frameFree
+	return chs, mergeCh, frameFree, nil
 }
 
 // NewTransport creates a transport that listens on listenAddr.
@@ -235,7 +258,19 @@ func (t *Transport) Stop() {
 			if p.conn != nil {
 				p.conn.Close()
 			}
+			for _, c := range p.inboundConns {
+				c.Close()
+			}
 			p.mu.Unlock()
+			for i := range p.laneConns {
+				lc := &p.laneConns[i]
+				lc.mu.Lock()
+				if lc.conn != nil {
+					lc.conn.Close()
+					lc.conn = nil
+				}
+				lc.mu.Unlock()
+			}
 			return true
 		})
 
@@ -274,7 +309,13 @@ func (t *Transport) SendTo(hostID, address string, env TransportEnvelope) error 
 
 	// Start encoder + flusher goroutines (once per peer lifetime).
 	p.writersOnce.Do(func() {
-		if p.mergeCh != nil {
+		if p.laneConns != nil {
+			// Multi-conn: N peerWriter goroutines, each with own conn.
+			for i := range p.sendChs {
+				t.wg.Add(1)
+				go t.peerWriter(p, i)
+			}
+		} else if p.mergeCh != nil {
 			// Multi-lane: N encoders feed a single flusher.
 			for i := range p.sendChs {
 				t.wg.Add(1)
@@ -389,16 +430,43 @@ func (t *Transport) handleInbound(conn net.Conn) {
 	if v, ok := t.peers.Load(remoteID); ok {
 		p = v.(*transportPeer)
 	} else {
-		chs, merge, free := makeSendChs(t.numLanes())
+		chs, merge, free, lcs := makeSendChs(t.numLanes(), t.multiConn > 0)
 		newP := &transportPeer{
 			hostID:    remoteID,
 			address:   peerAddr,
 			sendChs:   chs,
 			mergeCh:   merge,
 			frameFree: free,
+			laneConns: lcs,
 		}
 		actual, _ := t.peers.LoadOrStore(remoteID, newP)
 		p = actual.(*transportPeer)
+	}
+
+	// Multi-conn mode: accept all inbound connections without
+	// tie-breaking. Each lane conn gets its own readLoop.
+	if t.multiConn > 0 {
+		p.mu.Lock()
+		if peerAddr != "" {
+			p.address = peerAddr
+		}
+		p.inboundConns = append(p.inboundConns, conn)
+		p.mu.Unlock()
+		p.connected.Store(true)
+		t.readLoop(remoteID, conn)
+		conn.Close()
+		p.mu.Lock()
+		for i, c := range p.inboundConns {
+			if c == conn {
+				last := len(p.inboundConns) - 1
+				p.inboundConns[i] = p.inboundConns[last]
+				p.inboundConns[last] = nil
+				p.inboundConns = p.inboundConns[:last]
+				break
+			}
+		}
+		p.mu.Unlock()
+		return
 	}
 
 	p.mu.Lock()
@@ -455,16 +523,28 @@ func (t *Transport) getOrConnect(hostID, address string) (*transportPeer, error)
 	}
 
 	// Slow path: create peer entry if needed.
-	chs, merge, free := makeSendChs(t.numLanes())
+	chs, merge, free, lcs := makeSendChs(t.numLanes(), t.multiConn > 0)
 	newP := &transportPeer{
 		hostID:    hostID,
 		address:   address,
 		sendChs:   chs,
 		mergeCh:   merge,
 		frameFree: free,
+		laneConns: lcs,
 	}
 	actual, _ := t.peers.LoadOrStore(hostID, newP)
 	p := actual.(*transportPeer)
+
+	// Multi-conn mode: peer entry only, lazy dial per lane.
+	if t.multiConn > 0 {
+		p.mu.Lock()
+		if address != "" {
+			p.address = address
+		}
+		p.mu.Unlock()
+		p.connected.Store(true)
+		return p, nil
+	}
 
 	p.mu.Lock()
 	if p.conn != nil {
@@ -537,6 +617,20 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 	defer t.wg.Done()
 
 	ch := p.sendChs[lane]
+	useLane := p.laneConns != nil
+
+	// In multi-conn mode, clean up our lane connection on exit.
+	if useLane {
+		defer func() {
+			lc := &p.laneConns[lane]
+			lc.mu.Lock()
+			if lc.conn != nil {
+				lc.conn.Close()
+				lc.conn = nil
+			}
+			lc.mu.Unlock()
+		}()
+	}
 
 	var (
 		frameBuf          []byte
@@ -567,9 +661,28 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 			}
 		}
 
-		p.mu.Lock()
-		conn := p.conn
-		p.mu.Unlock()
+		// Get connection.
+		var conn net.Conn
+		if useLane {
+			lc := &p.laneConns[lane]
+			lc.mu.Lock()
+			conn = lc.conn
+			if conn == nil {
+				var err error
+				conn, err = t.dialLane(p, lane)
+				if err != nil {
+					lc.mu.Unlock()
+					recycleEnvelopes(batch[:n])
+					continue
+				}
+				lc.conn = conn
+			}
+			lc.mu.Unlock()
+		} else {
+			p.mu.Lock()
+			conn = p.conn
+			p.mu.Unlock()
+		}
 
 		if conn == nil {
 			recycleEnvelopes(batch[:n])
@@ -595,12 +708,31 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 		}
 
 		if writeErr != nil {
-			t.closePeerConn(p, conn)
+			if useLane {
+				t.closeLaneConn(p, lane, conn)
+			} else {
+				t.closePeerConn(p, conn)
+			}
 			curConn = nil
 
-			p.mu.Lock()
-			conn = p.conn
-			p.mu.Unlock()
+			// Reconnect.
+			if useLane {
+				lc := &p.laneConns[lane]
+				lc.mu.Lock()
+				var err error
+				conn, err = t.dialLane(p, lane)
+				if err != nil {
+					lc.mu.Unlock()
+					recycleEnvelopes(batch[:n])
+					continue
+				}
+				lc.conn = conn
+				lc.mu.Unlock()
+			} else {
+				p.mu.Lock()
+				conn = p.conn
+				p.mu.Unlock()
+			}
 			if conn == nil {
 				recycleEnvelopes(batch[:n])
 				continue
@@ -615,7 +747,11 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 				writeErr = writeBatchFrameTo(conn, &frameBuf, batch[:n])
 			}
 			if writeErr != nil {
-				t.closePeerConn(p, conn)
+				if useLane {
+					t.closeLaneConn(p, lane, conn)
+				} else {
+					t.closePeerConn(p, conn)
+				}
 				curConn = nil
 				recycleEnvelopes(batch[:n])
 				continue
@@ -819,6 +955,52 @@ func (t *Transport) closePeerConn(p *transportPeer, conn net.Conn) {
 		p.connected.Store(false)
 	}
 	p.mu.Unlock()
+}
+
+// dialLane dials a new TCP connection for the given send lane in multi-conn
+// mode. Performs a full handshake and verifies the remote hostID. Does NOT
+// start a readLoop — the remote's handleInbound starts one for each accepted
+// connection. Called lazily by peerWriter on first batch or after reconnect.
+func (t *Transport) dialLane(p *transportPeer, lane int) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", p.address, transportDialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("transport dial lane %d to %s (%s): %w", lane, p.hostID, p.address, err)
+	}
+
+	conn.SetDeadline(time.Now().Add(transportHandshakeTimeout))
+
+	if err := writeHandshake(conn, t.hostID, t.Addr()); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("transport lane handshake write: %w", err)
+	}
+
+	remoteID, _, err := readHandshake(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("transport lane handshake read: %w", err)
+	}
+
+	if remoteID != p.hostID {
+		conn.Close()
+		return nil, fmt.Errorf("transport lane handshake: expected %q, got %q", p.hostID, remoteID)
+	}
+
+	conn.SetDeadline(time.Time{})
+
+	slog.Info("transport lane connected", "remote", p.hostID, "lane", lane)
+	return conn, nil
+}
+
+// closeLaneConn closes a lane connection and clears it from the peer's
+// laneConns slot if it hasn't been replaced.
+func (t *Transport) closeLaneConn(p *transportPeer, lane int, conn net.Conn) {
+	conn.Close()
+	lc := &p.laneConns[lane]
+	lc.mu.Lock()
+	if lc.conn == conn {
+		lc.conn = nil
+	}
+	lc.mu.Unlock()
 }
 
 // --- read loop ---

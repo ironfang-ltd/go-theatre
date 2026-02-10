@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"time"
 )
 
@@ -33,7 +34,7 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 		server: &http.Server{
 			Handler:      mux,
 			ReadTimeout:  5 * time.Second,
-			WriteTimeout: 5 * time.Second,
+			WriteTimeout: 60 * time.Second,
 		},
 	}
 
@@ -42,6 +43,11 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 	mux.HandleFunc("/cluster/actor", as.handleClusterActor)
 	mux.HandleFunc("/cluster/local-actor", as.handleLocalActor)
 	mux.HandleFunc("/debug/vars", expvar.Handler().ServeHTTP)
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	return as, nil
 }
