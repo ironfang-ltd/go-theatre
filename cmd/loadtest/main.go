@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -97,6 +99,8 @@ func hostOptions(p profile, index int) []theatre.Option {
 		theatre.WithPanicRecovery(false),
 		theatre.WithActorInboxSize(p.actorInbox),
 		theatre.WithHostInboxSize(p.hostInbox),
+		theatre.WithOutboxSize(p.hostInbox),
+		theatre.WithOutboxWorkers(p.workers),
 		theatre.WithAdminAddr("127.0.0.1:" + strconv.Itoa(8081+index)),
 	}
 }
@@ -109,8 +113,37 @@ func main() {
 	duration := flag.Duration("duration", 30*time.Second, "test duration")
 	memlimit := flag.Int64("memlimit", -1, "GOMEMLIMIT in GiB (0=disabled, -1=from profile)")
 	sendpct := flag.Int("sendpct", 70, "percentage of Send vs Request (0-100)")
+	mode := flag.String("mode", "mixed", "worker mode: mixed (random actors via all hosts), forward (all workers enter host-1), local (workers only target local actors)")
 	dsn := flag.String("dsn", "", "Postgres connection string (empty = in-memory ring mode)")
+	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "write allocation profile to file")
 	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not create CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		pprof.StartCPUProfile(f)
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+		}()
+	}
+
+	if *memprofile != "" {
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "could not create memory profile: %v\n", err)
+				return
+			}
+			runtime.GC()
+			pprof.WriteHeapProfile(f)
+			f.Close()
+		}()
+	}
 
 	p, ok := profiles[*profileName]
 	if !ok {
@@ -130,6 +163,16 @@ func main() {
 	}
 	if *sendpct < 0 || *sendpct > 100 {
 		fmt.Fprintf(os.Stderr, "sendpct must be 0-100\n")
+		os.Exit(1)
+	}
+	switch *mode {
+	case "mixed", "forward", "local":
+	default:
+		fmt.Fprintf(os.Stderr, "unknown mode %q (valid: mixed, forward, local)\n", *mode)
+		os.Exit(1)
+	}
+	if *mode != "mixed" && *hostCount <= 1 {
+		fmt.Fprintf(os.Stderr, "mode %q requires --hosts > 1\n", *mode)
 		os.Exit(1)
 	}
 
@@ -159,6 +202,7 @@ func main() {
 	fmt.Printf("  hosts:    %d (%s)\n", *hostCount, modeLabel)
 	fmt.Printf("  actors:   %d\n", p.actors)
 	fmt.Printf("  workers:  %d per host (x%d = %d total)\n", p.workers, *hostCount, totalWorkers)
+	fmt.Printf("  mode:     %s\n", *mode)
 	fmt.Printf("  mix:      %d%% send / %d%% request\n", *sendpct, 100-*sendpct)
 	fmt.Printf("  duration: %s\n", *duration)
 	fmt.Printf("  GC:       %s\n", gcInfo)
@@ -197,10 +241,47 @@ func main() {
 
 	sendThreshold := float64(*sendpct) / 100.0
 
-	for _, he := range hosts {
-		for range p.workers {
+	// Pre-compute actor ID strings to avoid strconv.Itoa allocs in hot loop.
+	actorIDs := make([]string, p.actors)
+	for i := range actorIDs {
+		actorIDs[i] = strconv.Itoa(i)
+	}
+
+	// Build per-host actor ID lists for "local" mode.
+	// In local mode each worker only targets actors owned by its host,
+	// eliminating cross-host forwarding.
+	var perHostActorIDs [][]string
+	if *mode == "local" && *hostCount > 1 {
+		ring := theatre.NewHashRing()
+		hostIDs := make([]string, *hostCount)
+		for i := range hostIDs {
+			hostIDs[i] = fmt.Sprintf("host-%d", i+1)
+		}
+		ring.Set(hostIDs)
+
+		perHostActorIDs = make([][]string, *hostCount)
+		for _, id := range actorIDs {
+			owner, _ := ring.Lookup("worker:" + id)
+			for hi, hid := range hostIDs {
+				if hid == owner {
+					perHostActorIDs[hi] = append(perHostActorIDs[hi], id)
+					break
+				}
+			}
+		}
+		for hi, ids := range perHostActorIDs {
+			fmt.Printf("  %s owns %d actors\n", hosts[hi].name, len(ids))
+		}
+		fmt.Println()
+	}
+
+	// spawnWorkers launches n goroutines that send to h,
+	// picking from the given actor ID pool.
+	spawnWorkers := func(h *theatre.Host, pool []string, n int) {
+		poolSize := len(pool)
+		for range n {
 			wg.Add(1)
-			go func(h *theatre.Host) {
+			go func() {
 				defer wg.Done()
 				for {
 					select {
@@ -209,8 +290,7 @@ func main() {
 					default:
 					}
 
-					id := strconv.Itoa(rand.IntN(p.actors))
-					ref := theatre.NewRef("worker", id)
+					ref := theatre.NewRef("worker", pool[rand.IntN(poolSize)])
 
 					if rand.Float64() < sendThreshold {
 						if err := h.Send(ref, "ping"); err != nil {
@@ -228,7 +308,26 @@ func main() {
 						totalRequests.Add(1)
 					}
 				}
-			}(he.host)
+			}()
+		}
+	}
+
+	switch *mode {
+	case "mixed":
+		// Default: workers on all hosts, random actors. Tests cross-host forwarding.
+		for _, he := range hosts {
+			spawnWorkers(he.host, actorIDs, p.workers)
+		}
+	case "forward":
+		// All workers enter through host-1. Maximum forwarding pressure.
+		spawnWorkers(hosts[0].host, actorIDs, totalWorkers)
+	case "local":
+		// Each host's workers only target actors owned by that host. No forwarding.
+		for hi, he := range hosts {
+			if len(perHostActorIDs[hi]) == 0 {
+				continue
+			}
+			spawnWorkers(he.host, perHostActorIDs[hi], p.workers)
 		}
 	}
 
@@ -275,8 +374,6 @@ func main() {
 	fmt.Printf("  Aggregate RPS:   %.0f\n\n", float64(totalOps)/elapsed.Seconds())
 
 	printProgress(hosts, elapsed.Truncate(time.Second), &inits, &shutdowns)
-
-	os.Exit(0)
 }
 
 // setupStandalone creates a single standalone host (no transport, no cluster).

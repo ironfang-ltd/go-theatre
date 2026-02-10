@@ -56,6 +56,12 @@ type SQLDB interface {
 // It acquires an advisory lock on the host ID, registers with an epoch bump,
 // renews its lease periodically, polls for live hosts, and maintains a
 // consistent hash ring.
+// hostsSnapshot is an immutable snapshot of live hosts, swapped atomically.
+type hostsSnapshot struct {
+	list []HostInfo
+	byID map[string]HostInfo // O(1) lookup by host ID
+}
+
 type Cluster struct {
 	db     SQLDB
 	config ClusterConfig
@@ -66,6 +72,9 @@ type Cluster struct {
 	pgNow     time.Time // now() from Postgres at last renewal
 	localBase time.Time // time.Now() at last renewal / registration
 	hosts     []HostInfo
+
+	// Lock-free snapshot for hot-path reads (LiveHosts, HostLookup).
+	hostsSnap atomic.Pointer[hostsSnapshot]
 
 	ring         *HashRing
 	advisoryConn *sql.Conn
@@ -108,6 +117,19 @@ func (c *Cluster) SetHosts(hosts []HostInfo) {
 	c.mu.Lock()
 	c.hosts = hosts
 	c.mu.Unlock()
+	c.storeHostsSnapshot(hosts)
+}
+
+// storeHostsSnapshot builds an immutable snapshot and stores it atomically.
+func (c *Cluster) storeHostsSnapshot(hosts []HostInfo) {
+	snap := &hostsSnapshot{
+		list: hosts,
+		byID: make(map[string]HostInfo, len(hosts)),
+	}
+	for _, h := range hosts {
+		snap.byID[h.HostID] = h
+	}
+	c.hostsSnap.Store(snap)
 }
 
 // Start acquires the advisory lock, registers this host (bumping the epoch),
@@ -159,12 +181,21 @@ func (c *Cluster) DB() SQLDB { return c.db }
 func (c *Cluster) Ring() *HashRing { return c.ring }
 
 // LiveHosts returns a snapshot of the last polled live hosts.
+// The returned slice is shared and must not be modified.
 func (c *Cluster) LiveHosts() []HostInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	out := make([]HostInfo, len(c.hosts))
-	copy(out, c.hosts)
-	return out
+	if snap := c.hostsSnap.Load(); snap != nil {
+		return snap.list
+	}
+	return nil
+}
+
+// HostLookup returns the HostInfo for a given host ID. O(1) lookup.
+func (c *Cluster) HostLookup(hostID string) (HostInfo, bool) {
+	if snap := c.hostsSnap.Load(); snap != nil {
+		h, ok := snap.byID[hostID]
+		return h, ok
+	}
+	return HostInfo{}, false
 }
 
 // LocalHostID returns this host's configured ID.
@@ -391,6 +422,7 @@ func (c *Cluster) pollHosts(ctx context.Context) error {
 	c.mu.Lock()
 	c.hosts = hosts
 	c.mu.Unlock()
+	c.storeHostsSnapshot(hosts)
 
 	if changed {
 		c.ring.Set(members)

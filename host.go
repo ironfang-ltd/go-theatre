@@ -47,8 +47,7 @@ type Host struct {
 	placementCache *PlacementCache
 
 	// Pending remote requests awaiting reply or NotHere.
-	pendingRemoteMu sync.Mutex
-	pendingRemote   map[int64]*pendingRemoteRequest
+	pendingRemote *pendingRemoteMap
 
 	// Activation gate: deduplicates concurrent activations for the same Ref.
 	activating sync.Map // map[Ref]*activationGate
@@ -66,6 +65,7 @@ type Host struct {
 
 	// Stop idempotency.
 	stopOnce sync.Once
+	outboxWg sync.WaitGroup // tracks processOutbox goroutines
 }
 
 func NewHost(opts ...Option) *Host {
@@ -95,11 +95,11 @@ func NewHost(opts ...Option) *Host {
 				return &Response{}
 			},
 		},
+		pendingRemote: newPendingRemoteMap(),
 		outbox:        make(chan OutboxMessage, cfg.outboxSize),
 		inbox:         make(chan InboxMessage, cfg.hostInboxSize),
 		done:          make(chan struct{}),
-		pendingRemote: make(map[int64]*pendingRemoteRequest),
-		freezeCtx:    freezeCtx,
+		freezeCtx: freezeCtx,
 		freezeCancel: freezeCancel,
 		metrics:      metrics,
 	}
@@ -119,6 +119,7 @@ func (m *Host) Start() {
 	// In standalone mode, messages bypass the outbox entirely.
 	if m.cluster != nil {
 		for range m.config.outboxWorkers {
+			m.outboxWg.Add(1)
 			go m.processOutbox()
 		}
 	}
@@ -158,9 +159,18 @@ func (m *Host) Stop() {
 		// wait for in-flight messages to be processed or timeout
 		m.waitForDrain()
 
-		// phase 2: close done to stop processing goroutines
+		// phase 2: close done to stop processInbox, cleanup, freezeMonitor
 		close(m.done)
+
+		// phase 3: shut down all actors. processOutbox goroutines are
+		// still running (for range m.outbox) so any messages generated
+		// by actor Shutdown handlers can still be routed.
 		m.actors.RemoveAll()
+
+		// phase 4: all actors stopped, no more outbox writers.
+		// Close the outbox channel to signal processOutbox goroutines to exit.
+		close(m.outbox)
+		m.outboxWg.Wait()
 	})
 }
 
@@ -208,6 +218,37 @@ func (m *Host) sendInternal(msg OutboxMessage) {
 			Body:          msg.Body,
 			ReplyID:       msg.ReplyID,
 		}
+		return
+	}
+	// Cluster mode fast paths: handle local replies and local actor sends
+	// without going through the outbox channel.
+	if msg.IsReply && msg.recipientHostID == "" {
+		// Local reply: resolve directly to the waiting request.
+		req := m.requests.Get(msg.ReplyID)
+		if req != nil {
+			res := m.resPool.Get().(*Response)
+			res.Body = msg.Body
+			res.Error = msg.Error
+			req.Response <- res
+		}
+		m.metrics.MessagesReceived.Add(1)
+		return
+	}
+	if !msg.IsReply {
+		if a := m.actors.Lookup(msg.RecipientRef); a != nil {
+			a.Send(InboxMessage{
+				SenderHostRef: m.hostRef,
+				RecipientRef:  msg.RecipientRef,
+				Body:          msg.Body,
+				ReplyID:       msg.ReplyID,
+			})
+			m.metrics.MessagesReceived.Add(1)
+			return
+		}
+	}
+	// Remote reply: bypass outbox, send directly via transport.
+	if msg.IsReply && msg.recipientHostID != "" {
+		m.routeReply(msg)
 		return
 	}
 	m.outbox <- msg
@@ -262,7 +303,33 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 	}
 
 	if m.cluster != nil {
-		// Cluster mode: route through outbox.
+		// Cluster mode fast path: deliver directly to local actor.
+		if a := m.actors.Lookup(ref); a != nil {
+			a.Send(InboxMessage{
+				SenderHostRef: m.hostRef,
+				RecipientRef:  ref,
+				Body:          body,
+			})
+			m.metrics.MessagesSent.Add(1)
+			m.metrics.MessagesReceived.Add(1)
+			return nil
+		}
+		// Placement cache fast path: forward directly to remote peer,
+		// bypassing the outbox channel entirely.
+		if m.placementCache != nil {
+			if entry, ok := m.placementCache.Get(ref); ok {
+				if entry.HostID != m.cluster.LocalHostID() && m.isEntryLive(entry) {
+					msg := OutboxMessage{RecipientRef: ref, Body: body}
+					if err := m.forwardToRemote(entry.HostID, entry.Address, ref, msg); err == nil {
+						m.metrics.MessagesSent.Add(1)
+						m.metrics.PlacementCacheHits.Add(1)
+						return nil
+					}
+					m.placementCache.Evict(ref)
+				}
+			}
+		}
+		// Slow path: route through outbox for remote delivery or activation.
 		m.outbox <- OutboxMessage{
 			RecipientRef: ref,
 			Body:         body,
@@ -336,10 +403,34 @@ func (m *Host) requestInternal(ref Ref, body interface{}) (interface{}, error) {
 			m.inbox <- msg
 		}
 	} else {
-		m.outbox <- OutboxMessage{
-			RecipientRef: ref,
-			Body:         body,
-			ReplyID:      req.ID,
+		// Cluster mode fast path: deliver directly to local actor.
+		if a := m.actors.Lookup(ref); a != nil {
+			a.Send(msg)
+			m.metrics.MessagesReceived.Add(1)
+		} else {
+			forwarded := false
+			// Placement cache fast path: forward directly to remote peer.
+			if m.placementCache != nil {
+				if entry, ok := m.placementCache.Get(ref); ok {
+					if entry.HostID != m.cluster.LocalHostID() && m.isEntryLive(entry) {
+						outMsg := OutboxMessage{RecipientRef: ref, Body: body, ReplyID: req.ID}
+						if err := m.forwardToRemote(entry.HostID, entry.Address, ref, outMsg); err == nil {
+							m.metrics.PlacementCacheHits.Add(1)
+							forwarded = true
+						} else {
+							m.placementCache.Evict(ref)
+						}
+					}
+				}
+			}
+			if !forwarded {
+				// Slow path: route through outbox for remote delivery or activation.
+				m.outbox <- OutboxMessage{
+					RecipientRef: ref,
+					Body:         body,
+					ReplyID:      req.ID,
+				}
+			}
 		}
 	}
 
@@ -417,26 +508,22 @@ func (m *Host) processInbox() {
 }
 
 func (m *Host) processOutbox() {
-	for {
-		select {
-		case <-m.done:
-			return
-		case msg := <-m.outbox:
-			// When frozen, still drain replies but drop non-reply messages.
-			if m.frozen.Load() && !msg.IsReply {
-				if msg.ReplyID != 0 {
-					m.failPendingRequest(msg.ReplyID, ErrHostFrozen)
-				}
-				continue
+	defer m.outboxWg.Done()
+	for msg := range m.outbox {
+		// When frozen, still drain replies but drop non-reply messages.
+		if m.frozen.Load() && !msg.IsReply {
+			if msg.ReplyID != 0 {
+				m.failPendingRequest(msg.ReplyID, ErrHostFrozen)
 			}
+			continue
+		}
 
-			if msg.IsReply {
-				m.routeReply(msg)
-			} else if m.cluster != nil {
-				m.routeMessage(msg)
-			} else {
-				m.deliverLocal(msg)
-			}
+		if msg.IsReply {
+			m.routeReply(msg)
+		} else if m.cluster != nil {
+			m.routeMessage(msg)
+		} else {
+			m.deliverLocal(msg)
 		}
 	}
 }

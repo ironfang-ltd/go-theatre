@@ -72,16 +72,18 @@ func setupHostPair(t *testing.T) (hostA, hostB *Host, tA, tB *Transport, cleanup
 	ringAB := NewHashRing()
 	ringAB.Set([]string{"host-a", "host-b"})
 
+	hosts := []HostInfo{
+		{HostID: "host-a", Address: tA.Addr(), Epoch: 1},
+		{HostID: "host-b", Address: tB.Addr(), Epoch: 1},
+	}
+
 	hostA.transport = tA
 	hostA.cluster = &Cluster{config: ClusterConfig{HostID: "host-a"}, ring: ringAB}
 	hostA.placementCache = newPlacementCache(10)
 	hostA.cluster.mu.Lock()
 	hostA.cluster.epoch = 1
-	hostA.cluster.hosts = []HostInfo{
-		{HostID: "host-a", Address: tA.Addr(), Epoch: 1},
-		{HostID: "host-b", Address: tB.Addr(), Epoch: 1},
-	}
 	hostA.cluster.mu.Unlock()
+	hostA.cluster.SetHosts(hosts)
 	_ = stubA
 
 	hostB.transport = tB
@@ -89,11 +91,8 @@ func setupHostPair(t *testing.T) (hostA, hostB *Host, tA, tB *Transport, cleanup
 	hostB.placementCache = newPlacementCache(10)
 	hostB.cluster.mu.Lock()
 	hostB.cluster.epoch = 1
-	hostB.cluster.hosts = []HostInfo{
-		{HostID: "host-a", Address: tA.Addr(), Epoch: 1},
-		{HostID: "host-b", Address: tB.Addr(), Epoch: 1},
-	}
 	hostB.cluster.mu.Unlock()
+	hostB.cluster.SetHosts(hosts)
 	_ = stubB
 
 	hostA.Start()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 )
 
 // ErrNoOwner is returned when no live owner can be found for an actor.
@@ -17,6 +18,66 @@ type pendingRemoteRequest struct {
 	msg     OutboxMessage
 	ref     Ref
 	retried bool
+}
+
+var pendingRemotePool = sync.Pool{
+	New: func() any { return &pendingRemoteRequest{} },
+}
+
+// pendingRemoteMap is a sharded map[int64]*pendingRemoteRequest that replaces
+// sync.Map to eliminate per-operation internal node allocations (~824 MB).
+// Sharding by replyID avoids contention between outbox workers.
+const pendingRemoteShards = 64
+
+type pendingRemoteMap struct {
+	shards [pendingRemoteShards]pendingRemoteShard
+}
+
+type pendingRemoteShard struct {
+	mu sync.Mutex
+	m  map[int64]*pendingRemoteRequest
+}
+
+func newPendingRemoteMap() *pendingRemoteMap {
+	pm := &pendingRemoteMap{}
+	for i := range pm.shards {
+		pm.shards[i].m = make(map[int64]*pendingRemoteRequest)
+	}
+	return pm
+}
+
+func (pm *pendingRemoteMap) Store(id int64, pr *pendingRemoteRequest) {
+	s := &pm.shards[id&(pendingRemoteShards-1)]
+	s.mu.Lock()
+	s.m[id] = pr
+	s.mu.Unlock()
+}
+
+func (pm *pendingRemoteMap) LoadAndDelete(id int64) (*pendingRemoteRequest, bool) {
+	s := &pm.shards[id&(pendingRemoteShards-1)]
+	s.mu.Lock()
+	pr, ok := s.m[id]
+	if ok {
+		delete(s.m, id)
+	}
+	s.mu.Unlock()
+	return pr, ok
+}
+
+// Range iterates all entries across all shards. Used on cold paths only
+// (NotHere / HostFrozen retry).
+func (pm *pendingRemoteMap) Range(fn func(id int64, pr *pendingRemoteRequest) bool) {
+	for i := range pm.shards {
+		s := &pm.shards[i]
+		s.mu.Lock()
+		for k, v := range s.m {
+			if !fn(k, v) {
+				s.mu.Unlock()
+				return
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 // SetTransport wires the transport into this host. Must be called before Start.
@@ -132,21 +193,18 @@ func (m *Host) routeReply(msg OutboxMessage) {
 	}
 
 	// Remote reply via transport.
-	replyMsg := ActorForwardReply{
-		ReplyID: msg.ReplyID,
-		Body:    msg.Body,
-	}
+	reply := actorForwardReplyPool.Get().(*ActorForwardReply)
+	reply.ReplyID = msg.ReplyID
+	reply.Body = msg.Body
+	reply.Error = ""
 	if msg.Error != nil {
-		replyMsg.Error = msg.Error.Error()
+		reply.Error = msg.Error.Error()
 	}
-	env, err := Envelope(replyMsg)
-	if err != nil {
-		slog.Error("envelope error for reply", "error", err)
-		return
-	}
+	env := TransportEnvelope{Tag: TagActorForwardReply, Payload: reply}
 	if err := m.transport.SendTo(msg.recipientHostID, msg.recipientAddress, env); err != nil {
 		slog.Error("transport reply failed",
 			"recipientHostID", msg.recipientHostID, "error", err)
+		recyclePayload(env)
 	}
 }
 
@@ -165,17 +223,13 @@ func (m *Host) deliverLocal(msg OutboxMessage) {
 // --- remote forwarding ---
 
 func (m *Host) forwardToRemote(hostID, address string, ref Ref, msg OutboxMessage) error {
-	fwd := ActorForward{
-		ActorType:    ref.Type,
-		ActorID:      ref.ID,
-		Body:         msg.Body,
-		ReplyID:      msg.ReplyID,
-		SenderHostID: m.cluster.LocalHostID(),
-	}
-	env, err := Envelope(fwd)
-	if err != nil {
-		return err
-	}
+	fwd := actorForwardPool.Get().(*ActorForward)
+	fwd.ActorType = ref.Type
+	fwd.ActorID = ref.ID
+	fwd.Body = msg.Body
+	fwd.ReplyID = msg.ReplyID
+	fwd.SenderHostID = m.cluster.LocalHostID()
+	env := TransportEnvelope{Tag: TagActorForward, Payload: fwd}
 	if msg.ReplyID != 0 {
 		m.storePendingRemote(msg.ReplyID, ref, msg)
 	}
@@ -183,6 +237,7 @@ func (m *Host) forwardToRemote(hostID, address string, ref Ref, msg OutboxMessag
 		if msg.ReplyID != 0 {
 			m.removePendingRemote(msg.ReplyID)
 		}
+		recyclePayload(env)
 		return err
 	}
 	return nil
@@ -299,12 +354,11 @@ func (m *Host) isEntryLive(entry PlacementEntry) bool {
 	if m.cluster == nil {
 		return true // no liveness info → trust the cache
 	}
-	for _, h := range m.cluster.LiveHosts() {
-		if h.HostID == entry.HostID {
-			return h.Epoch == entry.Epoch
-		}
+	h, ok := m.cluster.HostLookup(entry.HostID)
+	if !ok {
+		return false
 	}
-	return false
+	return h.Epoch == entry.Epoch
 }
 
 // getHostAddress looks up a host's address from the liveness cache.
@@ -312,12 +366,11 @@ func (m *Host) getHostAddress(hostID string) string {
 	if m.cluster == nil {
 		return ""
 	}
-	for _, h := range m.cluster.LiveHosts() {
-		if h.HostID == hostID {
-			return h.Address
-		}
+	h, ok := m.cluster.HostLookup(hostID)
+	if !ok {
+		return ""
 	}
-	return ""
+	return h.Address
 }
 
 // --- inbound transport handlers ---
@@ -347,7 +400,12 @@ func (m *Host) handleActorForward(fromHostID string, msg *ActorForward) {
 		return
 	}
 
-	senderAddress := m.getHostAddress(fromHostID)
+	// Use transport peer address directly (zero-alloc sync.Map load)
+	// instead of getHostAddress which scans the cluster host list.
+	senderAddress := ""
+	if m.transport != nil {
+		senderAddress = m.transport.PeerAddress(fromHostID)
+	}
 
 	a.Send(InboxMessage{
 		RecipientRef:  ref,
@@ -392,16 +450,14 @@ func (m *Host) sendNotHere(toHostID string, fwd *ActorForward) {
 	if m.transport == nil || m.cluster == nil {
 		return
 	}
-	nh := NotHere{
-		ActorType: fwd.ActorType,
-		ActorID:   fwd.ActorID,
-		HostID:    m.cluster.LocalHostID(),
-		Epoch:     m.cluster.LocalEpoch(),
-	}
-	env, err := Envelope(nh)
-	if err != nil {
-		slog.Error("envelope error for NotHere", "error", err)
-		return
+	env := TransportEnvelope{
+		Tag: TagNotHere,
+		Payload: &NotHere{
+			ActorType: fwd.ActorType,
+			ActorID:   fwd.ActorID,
+			HostID:    m.cluster.LocalHostID(),
+			Epoch:     m.cluster.LocalEpoch(),
+		},
 	}
 	address := m.getHostAddress(toHostID)
 	if err := m.transport.SendTo(toHostID, address, env); err != nil {
@@ -413,17 +469,15 @@ func (m *Host) sendHostFrozen(toHostID string, fwd *ActorForward) {
 	if m.transport == nil || m.cluster == nil {
 		return
 	}
-	hf := HostFrozen{
-		ActorType: fwd.ActorType,
-		ActorID:   fwd.ActorID,
-		ReplyID:   fwd.ReplyID,
-		HostID:    m.cluster.LocalHostID(),
-		Epoch:     m.cluster.LocalEpoch(),
-	}
-	env, err := Envelope(hf)
-	if err != nil {
-		slog.Error("envelope error for HostFrozen", "error", err)
-		return
+	env := TransportEnvelope{
+		Tag: TagHostFrozen,
+		Payload: &HostFrozen{
+			ActorType: fwd.ActorType,
+			ActorID:   fwd.ActorID,
+			ReplyID:   fwd.ReplyID,
+			HostID:    m.cluster.LocalHostID(),
+			Epoch:     m.cluster.LocalEpoch(),
+		},
 	}
 	address := m.getHostAddress(toHostID)
 	if err := m.transport.SendTo(toHostID, address, env); err != nil {
@@ -447,24 +501,26 @@ func (m *Host) handleHostFrozen(msg *HostFrozen) {
 // --- pending remote request tracking ---
 
 func (m *Host) storePendingRemote(replyID int64, ref Ref, msg OutboxMessage) {
-	m.pendingRemoteMu.Lock()
-	m.pendingRemote[replyID] = &pendingRemoteRequest{msg: msg, ref: ref}
-	m.pendingRemoteMu.Unlock()
+	pr := pendingRemotePool.Get().(*pendingRemoteRequest)
+	pr.msg = msg
+	pr.ref = ref
+	pr.retried = false
+	m.pendingRemote.Store(replyID, pr)
 }
 
 func (m *Host) removePendingRemote(replyID int64) {
-	m.pendingRemoteMu.Lock()
-	delete(m.pendingRemote, replyID)
-	m.pendingRemoteMu.Unlock()
+	if pr, ok := m.pendingRemote.LoadAndDelete(replyID); ok {
+		*pr = pendingRemoteRequest{}
+		pendingRemotePool.Put(pr)
+	}
 }
 
 // retryPendingForActor re-resolves ownership and retries any pending
 // remote requests for the given actor. Max 1 retry per request.
 func (m *Host) retryPendingForActor(ref Ref) {
-	m.pendingRemoteMu.Lock()
 	var toRetry []*pendingRemoteRequest
 	var toFail []*pendingRemoteRequest
-	for _, pr := range m.pendingRemote {
+	m.pendingRemote.Range(func(_ int64, pr *pendingRemoteRequest) bool {
 		if pr.ref == ref {
 			if !pr.retried {
 				pr.retried = true
@@ -473,8 +529,8 @@ func (m *Host) retryPendingForActor(ref Ref) {
 				toFail = append(toFail, pr)
 			}
 		}
-	}
-	m.pendingRemoteMu.Unlock()
+		return true
+	})
 
 	// Fail requests that already had their one retry.
 	for _, pr := range toFail {
@@ -510,9 +566,10 @@ func (m *Host) retryPendingForActor(ref Ref) {
 }
 
 func (m *Host) failPendingRequest(replyID int64, err error) {
-	m.pendingRemoteMu.Lock()
-	delete(m.pendingRemote, replyID)
-	m.pendingRemoteMu.Unlock()
+	if pr, ok := m.pendingRemote.LoadAndDelete(replyID); ok {
+		*pr = pendingRemoteRequest{}
+		pendingRemotePool.Put(pr)
+	}
 
 	req := m.requests.Get(replyID)
 	if req != nil {

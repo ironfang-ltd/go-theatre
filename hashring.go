@@ -2,7 +2,6 @@ package theatre
 
 import (
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"sync/atomic"
 )
@@ -81,8 +80,15 @@ func (r *HashRing) Members() []string {
 }
 
 // fnvHash64 returns the FNV-1a 64-bit hash of s.
+// Inline implementation avoids the allocation from fnv.New64a()
+// and the string→[]byte copy.
 func fnvHash64(s string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(s))
-	return h.Sum64()
+	const offset64 = 14695981039346656037
+	const prime64 = 1099511628211
+	h := uint64(offset64)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
 }

@@ -484,23 +484,25 @@ func TestTransport_ForwardAndReply(t *testing.T) {
 
 	handlerA := func(from string, env TransportEnvelope) {
 		if msg, ok := env.Payload.(*ActorForwardReply); ok {
-			replyCh <- msg
+			cp := *msg // copy before return — readLoop recycles pooled structs
+			replyCh <- &cp
 		}
 	}
 
 	handlerB := func(from string, env TransportEnvelope) {
 		if msg, ok := env.Payload.(*ActorForward); ok {
-			forwardCh <- msg
-			// Reply back through the existing inbound connection.
-			env, err := Envelope(ActorForwardReply{
+			// Build reply BEFORE copying (uses msg fields directly).
+			replyEnv, err := Envelope(ActorForwardReply{
 				ReplyID: msg.ReplyID,
 				Body:    "pong:" + msg.Body.(string),
 			})
+			cp := *msg // copy before return — readLoop recycles pooled structs
+			forwardCh <- &cp
 			if err != nil {
 				t.Errorf("Envelope reply: %v", err)
 				return
 			}
-			tB.SendTo(from, "", env)
+			tB.SendTo(from, "", replyEnv)
 		}
 	}
 
@@ -750,16 +752,16 @@ func benchmarkMessages() map[string]TransportEnvelope {
 
 // encodeFrame encodes an envelope into its wire format (for read-side benchmarks).
 func encodeFrame(env TransportEnvelope) []byte {
-	var gobBuf bytes.Buffer
-	if err := gob.NewEncoder(&gobBuf).Encode(env.Payload); err != nil {
+	var buf bytes.Buffer
+	if err := encodePayload(&buf, env); err != nil {
 		panic(err)
 	}
-	gobBytes := gobBuf.Bytes()
-	frameLen := 1 + len(gobBytes)
+	payloadBytes := buf.Bytes()
+	frameLen := 1 + len(payloadBytes)
 	frame := make([]byte, 4+frameLen)
 	binary.BigEndian.PutUint32(frame[:4], uint32(frameLen))
 	frame[4] = env.Tag
-	copy(frame[5:], gobBytes)
+	copy(frame[5:], payloadBytes)
 	return frame
 }
 
@@ -828,8 +830,7 @@ func BenchmarkReadFrame(b *testing.B) {
 }
 
 // BenchmarkRoundTrip measures the full production write + read path through
-// a net.Pipe, using per-peer encoder and per-connection decoder (matching
-// the readLoop path).
+// a net.Pipe.
 func BenchmarkRoundTrip(b *testing.B) {
 	for name, env := range benchmarkMessages() {
 		b.Run(name, func(b *testing.B) {
@@ -840,10 +841,6 @@ func BenchmarkRoundTrip(b *testing.B) {
 			p := &transportPeer{hostID: "bench", conn: c1}
 			tr := &Transport{}
 
-			// Persistent decoder (matches readLoop).
-			var decBuf bytes.Buffer
-			dec := gob.NewDecoder(&decBuf)
-
 			errCh := make(chan error, 1)
 
 			b.ReportAllocs()
@@ -852,7 +849,7 @@ func BenchmarkRoundTrip(b *testing.B) {
 				go func() {
 					errCh <- tr.writeFrame(p, env)
 				}()
-				if _, err := decodeFrame(c2, dec, &decBuf); err != nil {
+				if _, err := decodeFrame(c2); err != nil {
 					b.Fatal(err)
 				}
 				if err := <-errCh; err != nil {
@@ -918,69 +915,20 @@ func BenchmarkGobDecode(b *testing.B) {
 	}
 }
 
-// BenchmarkDecodeFrame measures the optimized decode path with a persistent
-// decoder. Frames are pre-encoded with a persistent encoder (matching the
-// production writeFrame path) so steady-state frames omit type descriptions.
+// BenchmarkDecodeFrame measures the optimized decode path. Frames are
+// pre-encoded using the custom binary codec.
 func BenchmarkDecodeFrame(b *testing.B) {
 	for name, env := range benchmarkMessages() {
 		b.Run(name, func(b *testing.B) {
-			// Pre-encode a batch of frames using a persistent encoder.
-			var encBuf bytes.Buffer
-			enc := gob.NewEncoder(&encBuf)
-
-			const batch = 4096
-			frames := make([][]byte, batch)
-			for i := range frames {
-				encBuf.Reset()
-				if err := enc.Encode(env.Payload); err != nil {
-					b.Fatal(err)
-				}
-				gobBytes := encBuf.Bytes()
-				frameLen := 1 + len(gobBytes)
-				frame := make([]byte, 4+frameLen)
-				binary.BigEndian.PutUint32(frame[:4], uint32(frameLen))
-				frame[4] = env.Tag
-				copy(frame[5:], gobBytes)
-				frames[i] = frame
-			}
-
-			// Report steady-state frame size (frame[1+] after type warmup).
-			b.ReportMetric(float64(len(frames[batch-1])), "bytes/frame")
-
-			// Concatenate frames into a single stream for the decoder.
-			// First frame has type descriptions; decoder warms up on it.
-			var stream bytes.Buffer
-			for _, f := range frames {
-				stream.Write(f)
-			}
-			streamBytes := stream.Bytes()
-
-			// Persistent decoder.
-			var decBuf bytes.Buffer
-			dec := gob.NewDecoder(&decBuf)
-
-			// Warm up: decode first frame (has type info).
-			r := bytes.NewReader(streamBytes[:len(frames[0])])
-			if _, err := decodeFrame(r, dec, &decBuf); err != nil {
-				b.Fatal(err)
-			}
-
-			// Build steady-state stream (skip first frame).
-			offset0 := len(frames[0])
-			steadyBytes := streamBytes[offset0:]
+			// Pre-encode a single frame.
+			single := encodeFrame(env)
+			b.ReportMetric(float64(len(single)), "bytes/frame")
 
 			b.ReportAllocs()
 			b.ResetTimer()
-
-			steadyLen := len(steadyBytes)
-			frameSize := len(frames[1]) // all steady-state frames are identical
 			for i := 0; i < b.N; i++ {
-				offset := (i * frameSize) % steadyLen
-				if offset+frameSize > steadyLen {
-					offset = 0
-				}
-				r := bytes.NewReader(steadyBytes[offset : offset+frameSize])
-				if _, err := decodeFrame(r, dec, &decBuf); err != nil {
+				r := bytes.NewReader(single)
+				if _, err := decodeFrame(r); err != nil {
 					b.Fatal(err)
 				}
 			}

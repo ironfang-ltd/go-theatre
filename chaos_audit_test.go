@@ -11,6 +11,7 @@ import (
 // CreateAuditSchema creates the audit_events table for chaos test verification.
 // Safe to call multiple times (IF NOT EXISTS).
 func CreateAuditSchema(ctx context.Context, db *sql.DB) error {
+
 	_, err := db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS audit_events (
 	id          BIGSERIAL PRIMARY KEY,

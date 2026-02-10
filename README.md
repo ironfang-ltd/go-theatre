@@ -195,24 +195,43 @@ Admin ports: host-1 on `9090`, host-2 on `9091`, host-3 on `9092`. Press `Ctrl+C
 
 ### Load Test
 
-Configurable load test with preset profiles for benchmarking at different scales. Supports three modes depending on flags:
+Configurable load test with preset profiles for benchmarking at different scales. Supports three cluster topologies and three worker distribution modes.
+
+**Cluster topologies** (controlled by `-hosts` and `-dsn`):
 
 - **`-hosts 1`** — Standalone. Single host, no networking.
 - **`-hosts N`** (no `-dsn`) — Ring-only. N hosts with TCP transport and in-memory hash ring. No database.
 - **`-hosts N -dsn "..."`** — Postgres. N hosts with TCP transport and full Postgres cluster.
 
+**Worker modes** (controlled by `-mode`):
+
+- **`mixed`** (default) — Workers spread across all hosts, targeting random actors. Tests realistic cross-host forwarding via the hash ring.
+- **`forward`** — All workers enter through host-1. Maximizes forwarding pressure on a single entry point.
+- **`local`** — Each host's workers only target actors owned by that host (pre-computed via the hash ring). Zero cross-host traffic — tests pure local throughput.
+
 ```bash
-# Standalone
+# Standalone (single host, no networking)
 go run ./cmd/loadtest -profile small -hosts 1 -duration 10s
 
-# Multi-host with TCP transport (ring-only, no Postgres)
+# Multi-host ring-only with default mixed mode
 go run ./cmd/loadtest -profile medium -hosts 3 -duration 30s
+
+# Forward mode — all workers funnel through host-1
+go run ./cmd/loadtest -profile medium -hosts 3 -mode forward -duration 30s
+
+# Local mode — no cross-host forwarding
+go run ./cmd/loadtest -profile medium -hosts 3 -mode local -duration 30s
 
 # Multi-host with Postgres cluster
 go run ./cmd/loadtest -profile medium -hosts 3 -dsn "postgres://user:pass@localhost:5432/theatre?sslmode=disable" -duration 30s
 
 # Custom overrides
 go run ./cmd/loadtest -hosts 1 -actors 5000 -workers 25 -duration 20s
+
+# CPU / memory profiling
+go run ./cmd/loadtest -profile medium -hosts 3 -duration 15s -cpuprofile cpu.prof -memprofile mem.prof
+go tool pprof -http :8080 cpu.prof
+go tool pprof -top -alloc_space mem.prof
 ```
 
 #### Flags
@@ -221,12 +240,15 @@ go run ./cmd/loadtest -hosts 1 -actors 5000 -workers 25 -duration 20s
 |------|---------|-------------|
 | `-profile` | `small` | Preset: `small`, `medium`, `large`, `massive` |
 | `-hosts` | `3` | Number of hosts (1 = standalone) |
+| `-mode` | `mixed` | Worker mode: `mixed`, `forward`, `local` |
 | `-dsn` | _(empty)_ | Postgres connection string (empty = ring-only mode) |
 | `-actors` | from profile | Actor pool size (overrides profile) |
 | `-workers` | from profile | Workers per host (overrides profile) |
 | `-duration` | `30s` | Test duration |
 | `-memlimit` | from profile | GOMEMLIMIT in GiB (0 = disabled) |
 | `-sendpct` | `70` | Percentage Send vs Request (0-100) |
+| `-cpuprofile` | _(empty)_ | Write CPU profile to file |
+| `-memprofile` | _(empty)_ | Write allocation profile to file |
 
 #### Profiles
 

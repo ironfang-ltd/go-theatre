@@ -25,7 +25,7 @@ func (r *Request) Timeout() {
 const requestShards = 64
 
 type requestShard struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 	m  map[int64]*Request
 }
 
@@ -81,9 +81,9 @@ func (rm *RequestManager) Create(ref Ref) *Request {
 
 func (rm *RequestManager) Get(id int64) *Request {
 	s := rm.shard(id)
-	s.mu.Lock()
+	s.mu.RLock()
 	r := s.m[id]
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return r
 }
 
