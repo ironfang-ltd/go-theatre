@@ -37,6 +37,9 @@ type hostConfig struct {
 	// Log level for the structured JSON logger. Default: slog.LevelInfo.
 	logLevel slog.Level
 
+	// Scheduler recovery interval for overdue DB schedules (cluster mode).
+	scheduleRecoveryInterval time.Duration
+
 	// Test hooks (nil in production).
 	postClaimHook func(Ref) // called after successful ownership claim, before actor start
 }
@@ -56,7 +59,8 @@ func defaultHostConfig() hostConfig {
 		inboxWorkers:       runtime.GOMAXPROCS(0),
 		outboxWorkers:      runtime.GOMAXPROCS(0),
 		outboxSize:         4096,
-		panicRecovery:      true,
+		panicRecovery:              true,
+		scheduleRecoveryInterval:   10 * time.Second,
 	}
 }
 
@@ -178,6 +182,14 @@ func WithOutboxSize(n int) Option {
 func WithPanicRecovery(enabled bool) Option {
 	return func(c *hostConfig) {
 		c.panicRecovery = enabled
+	}
+}
+
+// WithScheduleRecoveryInterval sets how often the scheduler polls the database
+// for overdue schedules (cluster mode only). Default: 10s.
+func WithScheduleRecoveryInterval(d time.Duration) Option {
+	return func(c *hostConfig) {
+		c.scheduleRecoveryInterval = d
 	}
 }
 

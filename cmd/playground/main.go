@@ -36,8 +36,29 @@ func (e *echoReceiver) Receive(ctx *theatre.Context) error {
 	case string:
 		fmt.Printf("  [%s/%s] received: %q\n", e.name, ctx.ActorRef.ID, msg)
 		ctx.Reply(fmt.Sprintf("echo from %s: %s", e.name, msg))
+	case time.Time:
+		fmt.Printf("  [%s/%s] tick at %s\n", e.name, ctx.ActorRef.ID, msg.Format("15:04:05"))
 	default:
 		fmt.Printf("  [%s/%s] received: %T %v\n", e.name, ctx.ActorRef.ID, msg, msg)
+	}
+	return nil
+}
+
+// tickReceiver prints the time it receives, then reschedules itself in 5s.
+type tickReceiver struct {
+	name string
+}
+
+func (tr *tickReceiver) Receive(ctx *theatre.Context) error {
+	switch msg := ctx.Message.(type) {
+	case theatre.Initialize:
+		fmt.Printf("  [%s/%s] initialized\n", tr.name, ctx.ActorRef.ID)
+	case theatre.Shutdown:
+		fmt.Printf("  [%s/%s] shutting down\n", tr.name, ctx.ActorRef.ID)
+	case time.Time:
+		fmt.Printf("  [%s/%s] tick at %s\n", tr.name, ctx.ActorRef.ID, msg.Format("15:04:05.000"))
+		// Reschedule: send the current time again in 5s.
+		ctx.SendAfter(ctx.ActorRef, time.Now(), 5*time.Second)
 	}
 	return nil
 }
@@ -64,6 +85,9 @@ func main() {
 		h.RegisterActor("echo", func() theatre.Receiver {
 			return &echoReceiver{name: name}
 		})
+		h.RegisterActor("ticker", func() theatre.Receiver {
+			return &tickReceiver{name: name}
+		})
 
 		hosts[i] = hostInfo{host: h, adminAddr: adminAddr}
 	}
@@ -86,6 +110,27 @@ func main() {
 	}
 
 	time.Sleep(200 * time.Millisecond)
+	fmt.Println()
+
+	// Schedule a one-shot message on host-1, fires 30s after startup.
+	fmt.Println("--- Scheduling messages ---")
+	ref1 := theatre.NewRef("echo", "1")
+	id1, err := hosts[0].host.SendAfter(ref1, "delayed hello (30s)", 30*time.Second)
+	if err != nil {
+		log.Printf("SendAfter error: %v", err)
+	} else {
+		fmt.Printf("  host-1: scheduled one-shot in 30s (id=%d)\n", id1)
+	}
+
+	// Schedule a recurring tick on host-1, fires every 5s with the current time.
+	// Cron minimum resolution is 1 minute, so we chain SendAfter calls from
+	// inside the actor's Receive handler (see tickReceiver below).
+	tickRef := theatre.NewRef("ticker", "1")
+	if _, err := hosts[0].host.SendAfter(tickRef, time.Now(), 5*time.Second); err != nil {
+		log.Printf("SendAfter tick error: %v", err)
+	} else {
+		fmt.Printf("  host-1: recurring tick every 5s (actor ticker/1)\n")
+	}
 	fmt.Println()
 
 	// Send request/reply across hosts.

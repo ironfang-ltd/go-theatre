@@ -53,6 +53,9 @@ type Host struct {
 	// Activation gate: deduplicates concurrent activations for the same Ref.
 	activating sync.Map // map[Ref]*activationGate
 
+	// Scheduled message delivery.
+	scheduler *Scheduler
+
 	// Observability.
 	metrics     *Metrics
 	adminServer *AdminServer
@@ -107,6 +110,7 @@ func NewHost(opts ...Option) *Host {
 
 	metrics.actorCountFn = h.actors.Count
 	h.requests.resPool = &h.resPool
+	h.scheduler = newScheduler(h)
 
 	return h
 }
@@ -134,6 +138,13 @@ func (m *Host) Start() {
 		go m.freezeMonitor()
 	}
 
+	go m.scheduler.run()
+
+	// Start recovery loop in cluster mode (requires DB for schedule persistence).
+	if m.cluster != nil && m.cluster.DB() != nil {
+		go m.scheduler.recoveryLoop()
+	}
+
 	// Start admin server if configured.
 	if m.config.adminAddr != "" {
 		as, err := NewAdminServer(m, m.config.adminAddr)
@@ -156,6 +167,9 @@ func (m *Host) Stop() {
 
 		// phase 1: set draining flag to reject new external messages
 		m.draining.Store(true)
+
+		// stop scheduler before drain — no new scheduled messages
+		m.scheduler.stop()
 
 		// wait for in-flight messages to be processed or timeout
 		m.waitForDrain()

@@ -84,6 +84,7 @@ type clusterStatusResponse struct {
 	RemainingLeaseMs   int64          `json:"remaining_lease_ms,omitempty"`
 	RenewalFailures    int64          `json:"renewal_failures,omitempty"`
 	ActiveActors       int            `json:"active_actors"`
+	PendingSchedules   int            `json:"pending_schedules"`
 	RegisteredTypes    []string       `json:"registered_types"`
 	PlacementCacheSize int            `json:"placement_cache_size"`
 	Metrics            map[string]int64 `json:"metrics"`
@@ -109,11 +110,12 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 	}
 
 	resp := clusterStatusResponse{
-		HostID:          h.hostRef.String(),
-		State:           state,
-		ActiveActors:    h.actors.Count(),
-		RegisteredTypes: h.registeredTypes(),
-		Metrics:         h.metrics.Snapshot(),
+		HostID:           h.hostRef.String(),
+		State:            state,
+		ActiveActors:     h.actors.Count(),
+		PendingSchedules: h.scheduler.count(),
+		RegisteredTypes:  h.registeredTypes(),
+		Metrics:          h.metrics.Snapshot(),
 	}
 
 	if h.cluster != nil {

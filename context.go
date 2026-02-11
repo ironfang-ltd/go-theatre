@@ -1,6 +1,9 @@
 package theatre
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type Context struct {
 	// The ID of the current actor
@@ -35,6 +38,21 @@ func (c *Context) Send(ref Ref, body interface{}) error {
 
 func (c *Context) Request(ref Ref, body interface{}) (any, error) {
 	return c.host.requestInternal(ref, body)
+}
+
+// SendAfter schedules a one-shot message to be sent after the given delay.
+func (c *Context) SendAfter(ref Ref, body interface{}, delay time.Duration) (ScheduleID, error) {
+	return c.host.SendAfter(ref, body, delay)
+}
+
+// SendCron schedules a recurring message using a 5-field cron expression.
+func (c *Context) SendCron(ref Ref, body interface{}, cronExpr string) (ScheduleID, error) {
+	return c.host.SendCron(ref, body, cronExpr)
+}
+
+// CancelSchedule removes a scheduled message.
+func (c *Context) CancelSchedule(id ScheduleID) error {
+	return c.host.CancelSchedule(id)
 }
 
 func (c *Context) Reply(body interface{}) error {

@@ -91,6 +91,7 @@ func (m *Host) SetCluster(c *Cluster) {
 	m.cluster = c
 	m.localHostID = c.LocalHostID()
 	m.placementCache = newPlacementCache(int64(m.config.placementTTL.Seconds()))
+	m.scheduler.setDB(c.DB(), c.LocalHostID())
 }
 
 // HandleTransportMessage is the TransportHandler for this host.

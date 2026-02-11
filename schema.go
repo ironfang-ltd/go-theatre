@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS actor_ownership (
 	claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	PRIMARY KEY (actor_type, actor_id)
 );
+
+CREATE TABLE IF NOT EXISTS schedules (
+	schedule_id  BIGSERIAL PRIMARY KEY,
+	actor_type   TEXT NOT NULL,
+	actor_id     TEXT NOT NULL,
+	body         BYTEA NOT NULL,
+	cron_expr    TEXT,
+	next_fire    TIMESTAMPTZ NOT NULL,
+	one_shot     BOOLEAN NOT NULL DEFAULT false,
+	created_by   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_next_fire ON schedules (next_fire);
 `
 	_, err := db.ExecContext(ctx, ddl)
 	return err

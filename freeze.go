@@ -27,6 +27,9 @@ func (m *Host) Freeze() {
 	m.frozen.Store(true)
 	m.metrics.FreezeCount.Add(1)
 
+	// Step 1b: Cancel all scheduled messages — a frozen host should not fire them.
+	m.scheduler.cancelAll()
+
 	// Step 2: Cancel freezeCtx → all actor contexts are cancelled.
 	m.freezeMu.Lock()
 	m.freezeCancel()

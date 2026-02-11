@@ -23,6 +23,10 @@ type Metrics struct {
 	RequestsTotal    atomic.Int64
 	RequestsTimedOut atomic.Int64
 
+	SchedulesFired     atomic.Int64
+	SchedulesCancelled atomic.Int64
+	SchedulesRecovered atomic.Int64
+
 	FreezeCount atomic.Int64
 
 	PlacementCacheHits   atomic.Int64
@@ -54,6 +58,9 @@ func newMetrics() *Metrics {
 	publish("activations_failed", atomicVar(&m.ActivationsFailed))
 	publish("requests_total", atomicVar(&m.RequestsTotal))
 	publish("requests_timed_out", atomicVar(&m.RequestsTimedOut))
+	publish("schedules_fired", atomicVar(&m.SchedulesFired))
+	publish("schedules_cancelled", atomicVar(&m.SchedulesCancelled))
+	publish("schedules_recovered", atomicVar(&m.SchedulesRecovered))
 	publish("freeze_count", atomicVar(&m.FreezeCount))
 	publish("placement_cache_hits", atomicVar(&m.PlacementCacheHits))
 	publish("placement_cache_misses", atomicVar(&m.PlacementCacheMisses))
@@ -84,6 +91,9 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		"activations_failed":     m.ActivationsFailed.Load(),
 		"requests_total":         m.RequestsTotal.Load(),
 		"requests_timed_out":     m.RequestsTimedOut.Load(),
+		"schedules_fired":       m.SchedulesFired.Load(),
+		"schedules_cancelled":   m.SchedulesCancelled.Load(),
+		"schedules_recovered":   m.SchedulesRecovered.Load(),
 		"freeze_count":           m.FreezeCount.Load(),
 		"placement_cache_hits":   m.PlacementCacheHits.Load(),
 		"placement_cache_misses": m.PlacementCacheMisses.Load(),
