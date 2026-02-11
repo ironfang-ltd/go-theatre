@@ -115,8 +115,7 @@ func main() {
 	sendpct := flag.Int("sendpct", 70, "percentage of Send vs Request (0-100)")
 	mode := flag.String("mode", "mixed", "worker mode: mixed (random actors via all hosts), forward (all workers enter host-1), local (workers only target local actors)")
 	dsn := flag.String("dsn", "", "Postgres connection string (empty = in-memory ring mode)")
-	lanes := flag.Int("lanes", 4, "send lanes per peer (0=1, parallelizes encoding)")
-	multiconn := flag.Int("multiconn", 0, "connections per peer (0=single conn, >0=one conn per lane)")
+	lanes := flag.Int("lanes", 0, "send lanes per peer (0=auto from workers, each lane gets its own conn)")
 	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "write allocation profile to file")
 	contention := flag.Bool("contention", false, "enable block+mutex contention profiling via admin pprof endpoints")
@@ -184,6 +183,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Auto-tune send lanes from workers: ~15 workers per lane, capped at 8.
+	if *lanes == 0 && *hostCount > 1 {
+		*lanes = p.workers / 5
+		if *lanes < 1 {
+			*lanes = 1
+		}
+		if *lanes > 8 {
+			*lanes = 8
+		}
+	}
+
 	totalWorkers := p.workers * *hostCount
 
 	// GC tuning.
@@ -216,10 +226,7 @@ func main() {
 	fmt.Printf("  GC:       %s\n", gcInfo)
 	fmt.Printf("  inbox:    actor=%d  host=%d\n", p.actorInbox, p.hostInbox)
 	if *hostCount > 1 {
-		fmt.Printf("  lanes:    %d per peer\n", *lanes)
-		if *multiconn > 0 {
-			fmt.Printf("  multiconn: %d conns per peer\n", *multiconn)
-		}
+		fmt.Printf("  lanes:    %d per peer (%d conns)\n", *lanes, *lanes)
 	}
 	fmt.Println()
 
@@ -233,10 +240,10 @@ func main() {
 		hosts = setupStandalone(p, &inits, &shutdowns)
 	} else if *dsn != "" {
 		// Postgres cluster mode.
-		hosts, extraCleanup = setupPostgresCluster(p, *hostCount, *dsn, &inits, &shutdowns)
+		hosts, extraCleanup = setupPostgresCluster(p, *hostCount, *dsn, *lanes, &inits, &shutdowns)
 	} else {
 		// Ring-only mode — transport + hash ring, no DB.
-		hosts, extraCleanup = setupRingCluster(p, *hostCount, *lanes, *multiconn, &inits, &shutdowns)
+		hosts, extraCleanup = setupRingCluster(p, *hostCount, *lanes, &inits, &shutdowns)
 	}
 
 	for _, he := range hosts {
@@ -402,7 +409,7 @@ func setupStandalone(p profile, inits, shutdowns *atomic.Int64) []*hostEntry {
 
 // setupRingCluster creates N hosts with TCP transport and a shared hash ring
 // for deterministic actor placement. No Postgres database is used.
-func setupRingCluster(p profile, n int, lanes int, multiConn int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
+func setupRingCluster(p profile, n int, lanes int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
 	hosts := make([]*hostEntry, n)
 	transports := make([]*theatre.Transport, n)
 	hostIDs := make([]string, n)
@@ -424,9 +431,7 @@ func setupRingCluster(p profile, n int, lanes int, multiConn int, inits, shutdow
 			os.Exit(1)
 		}
 		t.SetSendLanes(lanes)
-		if multiConn > 0 {
-			t.SetMultiConn(multiConn)
-		}
+		t.SetMultiConn(lanes)
 		t.SetDispatchWorkers(lanes)
 		t.Start()
 		transports[i] = t
@@ -462,7 +467,7 @@ func setupRingCluster(p profile, n int, lanes int, multiConn int, inits, shutdow
 
 // setupPostgresCluster creates N hosts backed by a real Postgres cluster
 // with lease management, ownership claims, and transport.
-func setupPostgresCluster(p profile, n int, dsn string, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
+func setupPostgresCluster(p profile, n int, dsn string, lanes int, inits, shutdowns *atomic.Int64) ([]*hostEntry, func()) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "database open error: %v\n", err)
@@ -493,6 +498,9 @@ func setupPostgresCluster(p profile, n int, dsn string, inits, shutdowns *atomic
 			fmt.Fprintf(os.Stderr, "transport error: %v\n", err)
 			os.Exit(1)
 		}
+		t.SetSendLanes(lanes)
+		t.SetMultiConn(lanes)
+		t.SetDispatchWorkers(lanes)
 		t.Start()
 		transports[i] = t
 
