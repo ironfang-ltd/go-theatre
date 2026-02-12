@@ -118,6 +118,20 @@ func (am *ActorRegistry) ForceDeregisterAll() []Ref {
 	return refs
 }
 
+// All returns a snapshot of all registered actors.
+func (am *ActorRegistry) All() []*Actor {
+	var actors []*Actor
+	for i := range am.shards {
+		s := &am.shards[i]
+		s.mu.RLock()
+		for _, a := range s.m {
+			actors = append(actors, a)
+		}
+		s.mu.RUnlock()
+	}
+	return actors
+}
+
 // Count returns the number of registered actors.
 func (am *ActorRegistry) Count() int {
 	count := 0

@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"expvar"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"reflect"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +43,10 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 
 	mux.HandleFunc("/cluster/status", as.handleClusterStatus)
 	mux.HandleFunc("/cluster/hosts", as.handleClusterHosts)
+	mux.HandleFunc("/cluster/actors", as.handleClusterActors)
+	mux.HandleFunc("/cluster/actor-detail", as.handleActorDetail)
+	mux.HandleFunc("/cluster/schedules", as.handleClusterSchedules)
+	mux.HandleFunc("/cluster/types", as.handleClusterTypes)
 	mux.HandleFunc("/cluster/actor", as.handleClusterActor)
 	mux.HandleFunc("/cluster/local-actor", as.handleLocalActor)
 	mux.HandleFunc("/debug/vars", expvar.Handler().ServeHTTP)
@@ -48,6 +55,7 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/", dashboardHandler(host.config.dashboardDev))
 
 	return as, nil
 }
@@ -79,7 +87,7 @@ func (as *AdminServer) Stop() {
 // clusterStatusResponse is the JSON structure for GET /cluster/status.
 type clusterStatusResponse struct {
 	HostID             string         `json:"host_id"`
-	State              string         `json:"state"` // "active", "frozen", "draining", "standalone"
+	State              string         `json:"state"` // "standalone", "clustered", "frozen", "draining"
 	Epoch              int64          `json:"epoch,omitempty"`
 	RemainingLeaseMs   int64          `json:"remaining_lease_ms,omitempty"`
 	RenewalFailures    int64          `json:"renewal_failures,omitempty"`
@@ -98,10 +106,11 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 
 	h := as.host
 
-	state := "active"
-	if h.cluster == nil {
-		state = "standalone"
-	} else if h.frozen.Load() {
+	state := "standalone"
+	if h.cluster != nil {
+		state = "clustered"
+	}
+	if h.cluster != nil && h.frozen.Load() {
 		if h.draining.Load() {
 			state = "draining"
 		} else {
@@ -139,6 +148,7 @@ type clusterHostsResponse struct {
 type hostEntry struct {
 	HostID      string `json:"host_id"`
 	Address     string `json:"address"`
+	AdminAddr   string `json:"admin_addr,omitempty"`
 	Epoch       int64  `json:"epoch"`
 	LeaseExpiry string `json:"lease_expiry"`
 }
@@ -161,12 +171,57 @@ func (as *AdminServer) handleClusterHosts(w http.ResponseWriter, r *http.Request
 		entries[i] = hostEntry{
 			HostID:      hi.HostID,
 			Address:     hi.Address,
+			AdminAddr:   hi.AdminAddr,
 			Epoch:       hi.Epoch,
 			LeaseExpiry: hi.LeaseExpiry.Format(time.RFC3339),
 		}
 	}
 
 	writeJSON(w, clusterHostsResponse{Hosts: entries})
+}
+
+// actorEntry is a single actor in the GET /cluster/actors response.
+type actorEntry struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	Status      string `json:"status"`
+	LastMessage string `json:"last_message,omitempty"`
+	InboxSize   int    `json:"inbox_size"`
+	InboxCap    int    `json:"inbox_cap"`
+}
+
+// clusterActorsResponse is the JSON structure for GET /cluster/actors.
+type clusterActorsResponse struct {
+	Actors []actorEntry `json:"actors"`
+}
+
+func (as *AdminServer) handleClusterActors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	actors := as.host.actors.All()
+	entries := make([]actorEntry, len(actors))
+	for i, a := range actors {
+		status := "active"
+		if a.GetStatus() != ActorStatusActive {
+			status = "inactive"
+		}
+		e := actorEntry{
+			Type:      a.ref.Type,
+			ID:        a.ref.ID,
+			Status:    status,
+			InboxSize: len(a.inbox),
+			InboxCap:  cap(a.inbox),
+		}
+		if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
+			e.LastMessage = lastMsg.Format(time.RFC3339)
+		}
+		entries[i] = e
+	}
+
+	writeJSON(w, clusterActorsResponse{Actors: entries})
 }
 
 // clusterActorResponse is the JSON structure for GET /cluster/actor.
@@ -275,6 +330,158 @@ func (as *AdminServer) handleLocalActor(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, resp)
+}
+
+// actorDetailResponse is the JSON structure for GET /cluster/actor-detail.
+type actorDetailResponse struct {
+	Type          string `json:"type"`
+	ID            string `json:"id"`
+	Found         bool   `json:"found"`
+	Status        string `json:"status,omitempty"`
+	ReceiverType  string `json:"receiver_type,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	LastMessage   string `json:"last_message,omitempty"`
+	UptimeMs      int64  `json:"uptime_ms,omitempty"`
+	MessagesTotal int64  `json:"messages_total,omitempty"`
+	ErrorsTotal   int64  `json:"errors_total,omitempty"`
+	InboxSize     int    `json:"inbox_size,omitempty"`
+	InboxCap      int    `json:"inbox_cap,omitempty"`
+
+	// Cluster ownership (if available).
+	OwnerHost string `json:"owner_host,omitempty"`
+	OwnerAddr string `json:"owner_addr,omitempty"`
+	Epoch     int64  `json:"epoch,omitempty"`
+}
+
+func (as *AdminServer) handleActorDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	actorType := r.URL.Query().Get("type")
+	actorID := r.URL.Query().Get("id")
+	if actorType == "" || actorID == "" {
+		http.Error(w, `missing "type" or "id" query parameter`, http.StatusBadRequest)
+		return
+	}
+
+	h := as.host
+	ref := NewRef(actorType, actorID)
+
+	resp := actorDetailResponse{
+		Type: actorType,
+		ID:   actorID,
+	}
+
+	// Local actor info.
+	a := h.actors.Lookup(ref)
+	if a != nil {
+		resp.Found = true
+		if a.GetStatus() == ActorStatusActive {
+			resp.Status = "active"
+		} else {
+			resp.Status = "inactive"
+		}
+
+		// Receiver type name via reflection.
+		rt := reflect.TypeOf(a.receiver)
+		if rt.Kind() == reflect.Ptr {
+			resp.ReceiverType = fmt.Sprintf("*%s", rt.Elem().Name())
+		} else {
+			resp.ReceiverType = rt.Name()
+		}
+
+		createdAt := atomic.LoadInt64(&a.createdAt)
+		if createdAt > 0 {
+			resp.CreatedAt = time.Unix(createdAt, 0).Format(time.RFC3339)
+			resp.UptimeMs = time.Since(time.Unix(createdAt, 0)).Milliseconds()
+		}
+
+		if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
+			resp.LastMessage = lastMsg.Format(time.RFC3339)
+		}
+
+		resp.MessagesTotal = atomic.LoadInt64(&a.messagesTotal)
+		resp.ErrorsTotal = atomic.LoadInt64(&a.errorsTotal)
+		resp.InboxSize = len(a.inbox)
+		resp.InboxCap = cap(a.inbox)
+	}
+
+	// Cluster ownership info.
+	if h.placementCache != nil {
+		if entry, ok := h.placementCache.Get(ref); ok {
+			resp.OwnerHost = entry.HostID
+			resp.OwnerAddr = entry.Address
+			resp.Epoch = entry.Epoch
+		}
+	}
+	if resp.OwnerHost == "" && h.cluster != nil && h.cluster.DB() != nil {
+		if owner, err := h.resolveOwner(ref); err == nil && owner != nil {
+			resp.OwnerHost = owner.HostID
+			resp.OwnerAddr = owner.Address
+			resp.Epoch = owner.Epoch
+		}
+	}
+
+	writeJSON(w, resp)
+}
+
+// scheduleEntry is a single schedule in the GET /cluster/schedules response.
+type scheduleEntry struct {
+	ID        int64  `json:"id"`
+	ActorType string `json:"actor_type"`
+	ActorID   string `json:"actor_id"`
+	Body      string `json:"body"`
+	Kind      string `json:"kind"` // "one-shot" or "cron"
+	CronExpr  string `json:"cron_expr,omitempty"`
+	NextFire  string `json:"next_fire"`
+}
+
+// clusterSchedulesResponse is the JSON structure for GET /cluster/schedules.
+type clusterSchedulesResponse struct {
+	Schedules []scheduleEntry `json:"schedules"`
+}
+
+func (as *AdminServer) handleClusterSchedules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	infos := as.host.scheduler.list()
+	entries := make([]scheduleEntry, len(infos))
+	for i, s := range infos {
+		kind := "cron"
+		if s.OneShot {
+			kind = "one-shot"
+		}
+		entries[i] = scheduleEntry{
+			ID:        int64(s.ID),
+			ActorType: s.Ref.Type,
+			ActorID:   s.Ref.ID,
+			Body:      s.Body,
+			Kind:      kind,
+			CronExpr:  s.CronExpr,
+			NextFire:  s.NextFire.Format(time.RFC3339),
+		}
+	}
+
+	writeJSON(w, clusterSchedulesResponse{Schedules: entries})
+}
+
+// clusterTypesResponse is the JSON structure for GET /cluster/types.
+type clusterTypesResponse struct {
+	Types []string `json:"types"`
+}
+
+func (as *AdminServer) handleClusterTypes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	writeJSON(w, clusterTypesResponse{Types: as.host.registeredTypes()})
 }
 
 // --- helpers ---

@@ -217,6 +217,35 @@ func (s *Scheduler) count() int {
 	return n
 }
 
+// scheduleInfo is the public snapshot of a schedule for admin endpoints.
+type scheduleInfo struct {
+	ID       ScheduleID
+	Ref      Ref
+	Body     string
+	CronExpr string
+	NextFire time.Time
+	OneShot  bool
+}
+
+// list returns a snapshot of all pending schedules.
+func (s *Scheduler) list() []scheduleInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]scheduleInfo, 0, len(s.schedules))
+	for _, sched := range s.schedules {
+		out = append(out, scheduleInfo{
+			ID:       sched.id,
+			Ref:      sched.ref,
+			Body:     fmt.Sprintf("%v", sched.body),
+			CronExpr: sched.cronExpr,
+			NextFire: sched.nextFire,
+			OneShot:  sched.oneShot,
+		})
+	}
+	return out
+}
+
 // timeUntilNext returns the duration until the earliest nextFire,
 // or 0 if there are no schedules.
 func (s *Scheduler) timeUntilNext() time.Duration {

@@ -1,13 +1,19 @@
-// playground spins up 3 standalone hosts, each with an echo actor,
-// sends a few messages and requests, then blocks so you can poke
-// around the admin endpoints.
+// playground spins up 3 clustered hosts connected via transport,
+// sends messages and cross-host requests, then blocks so you can
+// explore the dashboard and admin endpoints.
 //
-// Run:  go run ./cmd/playground
+// Run:
+//
+//	cd web/dashboard && npm run dev   # start Vite on :3000
+//	go run ./cmd/playground           # start hosts (dashboard on :9090)
 //
 // Admin endpoints (per host):
 //
+//	GET /                      — dashboard (host-1 only, proxied to Vite in dev)
 //	GET /cluster/status        — host state, metrics, registered types
-//	GET /cluster/local-actor?type=echo&id=1  — actor status
+//	GET /cluster/hosts         — live cluster members
+//	GET /cluster/actors        — all local actors
+//	GET /cluster/actor-detail?type=echo&id=1  — actor detail
 //	GET /debug/vars            — expvar metrics
 package main
 
@@ -66,21 +72,29 @@ func (tr *tickReceiver) Receive(ctx *theatre.Context) error {
 func main() {
 	const numHosts = 3
 
-	type hostInfo struct {
+	type node struct {
 		host      *theatre.Host
+		transport *theatre.Transport
+		hostID    string
 		adminAddr string
 	}
 
-	hosts := make([]hostInfo, numHosts)
+	nodes := make([]node, numHosts)
 
-	for i := range hosts {
+	// Phase 1: Create hosts, transports, register actors.
+	for i := range nodes {
 		adminAddr := fmt.Sprintf("127.0.0.1:%d", 9090+i)
-		name := fmt.Sprintf("host-%d", i+1)
+		hostID := fmt.Sprintf("host-%d", i+1)
+		name := hostID
 
-		h := theatre.NewHost(
+		opts := []theatre.Option{
 			theatre.WithAdminAddr(adminAddr),
-			theatre.WithIdleTimeout(5*time.Minute),
-		)
+			theatre.WithIdleTimeout(5 * time.Minute),
+		}
+		if i == 0 {
+			opts = append(opts, theatre.WithDashboardDev())
+		}
+		h := theatre.NewHost(opts...)
 
 		h.RegisterActor("echo", func() theatre.Receiver {
 			return &echoReceiver{name: name}
@@ -89,22 +103,58 @@ func main() {
 			return &tickReceiver{name: name}
 		})
 
-		hosts[i] = hostInfo{host: h, adminAddr: adminAddr}
+		// Create transport (bind to :0 for auto port).
+		t, err := theatre.NewTransport(hostID, "127.0.0.1:0", h.HandleTransportMessage)
+		if err != nil {
+			log.Fatalf("transport %s: %v", hostID, err)
+		}
+		t.Start()
+
+		nodes[i] = node{
+			host:      h,
+			transport: t,
+			hostID:    hostID,
+			adminAddr: adminAddr,
+		}
 	}
 
-	// Start all hosts.
-	for i, hi := range hosts {
-		hi.host.Start()
-		fmt.Printf("host-%d started  admin=http://%s\n", i+1, hi.adminAddr)
+	// Phase 2: Build cluster membership and wire everything up.
+	ringMembers := make([]string, numHosts)
+	hostInfos := make([]theatre.HostInfo, numHosts)
+	for i, n := range nodes {
+		ringMembers[i] = n.hostID
+		hostInfos[i] = theatre.HostInfo{
+			HostID:    n.hostID,
+			Address:   n.transport.Addr(),
+			AdminAddr: n.adminAddr,
+			Epoch:     1,
+		}
+	}
+
+	for i, n := range nodes {
+		cluster := theatre.NewRingOnlyCluster(n.hostID, n.transport.Addr(), 1)
+		cluster.Ring().Set(ringMembers)
+		cluster.SetHosts(hostInfos)
+
+		n.host.SetTransport(n.transport)
+		n.host.SetCluster(cluster)
+		nodes[i] = n
+	}
+
+	// Phase 3: Start all hosts.
+	for _, n := range nodes {
+		n.host.Start()
+		fmt.Printf("%s started  admin=http://%s  transport=%s\n",
+			n.hostID, n.adminAddr, n.transport.Addr())
 	}
 
 	fmt.Println()
 
 	// Send some fire-and-forget messages.
 	fmt.Println("--- Sending messages ---")
-	for i, hi := range hosts {
+	for i, n := range nodes {
 		ref := theatre.NewRef("echo", fmt.Sprintf("%d", i+1))
-		if err := hi.host.Send(ref, fmt.Sprintf("hello from host-%d", i+1)); err != nil {
+		if err := n.host.Send(ref, fmt.Sprintf("hello from %s", n.hostID)); err != nil {
 			log.Printf("send error: %v", err)
 		}
 	}
@@ -115,49 +165,59 @@ func main() {
 	// Schedule a one-shot message on host-1, fires 30s after startup.
 	fmt.Println("--- Scheduling messages ---")
 	ref1 := theatre.NewRef("echo", "1")
-	id1, err := hosts[0].host.SendAfter(ref1, "delayed hello (30s)", 30*time.Second)
+	id1, err := nodes[0].host.SendAfter(ref1, "delayed hello (30s)", 30*time.Second)
 	if err != nil {
 		log.Printf("SendAfter error: %v", err)
 	} else {
 		fmt.Printf("  host-1: scheduled one-shot in 30s (id=%d)\n", id1)
 	}
 
-	// Schedule a recurring tick on host-1, fires every 5s with the current time.
-	// Cron minimum resolution is 1 minute, so we chain SendAfter calls from
-	// inside the actor's Receive handler (see tickReceiver below).
+	// Schedule a recurring tick on host-1 via self-rescheduling SendAfter.
 	tickRef := theatre.NewRef("ticker", "1")
-	if _, err := hosts[0].host.SendAfter(tickRef, time.Now(), 5*time.Second); err != nil {
+	if _, err := nodes[0].host.SendAfter(tickRef, time.Now(), 5*time.Second); err != nil {
 		log.Printf("SendAfter tick error: %v", err)
 	} else {
 		fmt.Printf("  host-1: recurring tick every 5s (actor ticker/1)\n")
 	}
+
+	// Schedule a cron job on host-2, fires every minute.
+	cronRef := theatre.NewRef("echo", "cron")
+	if id, err := nodes[1].host.SendCron(cronRef, "cron ping", "* * * * *"); err != nil {
+		log.Printf("SendCron error: %v", err)
+	} else {
+		fmt.Printf("  host-2: cron every minute (id=%d, actor echo/cron)\n", id)
+	}
 	fmt.Println()
 
-	// Send request/reply across hosts.
-	fmt.Println("--- Sending requests ---")
+	// Send cross-host requests (each host requests echo/1 — the ring
+	// determines which host owns it, transport routes the message).
+	fmt.Println("--- Sending cross-host requests ---")
 	var wg sync.WaitGroup
-	for i, hi := range hosts {
+	for i, n := range nodes {
 		wg.Add(1)
-		go func(idx int, h *theatre.Host) {
+		go func(idx int, h *theatre.Host, hostID string) {
 			defer wg.Done()
 			ref := theatre.NewRef("echo", "1")
-			resp, err := h.Request(ref, fmt.Sprintf("request from host-%d", idx+1))
+			resp, err := h.Request(ref, fmt.Sprintf("request from %s", hostID))
 			if err != nil {
-				fmt.Printf("  host-%d request error: %v\n", idx+1, err)
+				fmt.Printf("  %s request error: %v\n", hostID, err)
 				return
 			}
-			fmt.Printf("  host-%d got reply: %v\n", idx+1, resp)
-		}(i, hi.host)
+			fmt.Printf("  %s got reply: %v\n", hostID, resp)
+		}(i, n.host, n.hostID)
 	}
 	wg.Wait()
 
 	fmt.Println()
-	fmt.Println("--- Hosts running. Try these endpoints: ---")
-	for i, hi := range hosts {
-		fmt.Printf("  host-%d:\n", i+1)
-		fmt.Printf("    curl http://%s/cluster/status\n", hi.adminAddr)
-		fmt.Printf("    curl http://%s/cluster/local-actor?type=echo&id=%d\n", hi.adminAddr, i+1)
-		fmt.Printf("    curl http://%s/debug/vars\n", hi.adminAddr)
+	fmt.Println("--- Cluster running. Try these endpoints: ---")
+	fmt.Printf("  Dashboard: http://%s/\n", nodes[0].adminAddr)
+	fmt.Println()
+	for _, n := range nodes {
+		fmt.Printf("  %s:\n", n.hostID)
+		fmt.Printf("    curl http://%s/cluster/status\n", n.adminAddr)
+		fmt.Printf("    curl http://%s/cluster/hosts\n", n.adminAddr)
+		fmt.Printf("    curl http://%s/cluster/actors\n", n.adminAddr)
+		fmt.Printf("    curl http://%s/debug/vars\n", n.adminAddr)
 	}
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop.")
@@ -168,8 +228,9 @@ func main() {
 	<-sig
 
 	fmt.Println("\nShutting down...")
-	for i := len(hosts) - 1; i >= 0; i-- {
-		hosts[i].host.Stop()
-		fmt.Printf("host-%d stopped\n", i+1)
+	for i := len(nodes) - 1; i >= 0; i-- {
+		nodes[i].host.Stop()
+		nodes[i].transport.Stop()
+		fmt.Printf("%s stopped\n", nodes[i].hostID)
 	}
 }

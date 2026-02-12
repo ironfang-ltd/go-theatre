@@ -37,7 +37,8 @@ func (c *ClusterConfig) applyDefaults() {
 // HostInfo describes a live host as seen by the polling query.
 type HostInfo struct {
 	HostID      string
-	Address     string
+	Address     string // transport address
+	AdminAddr   string // admin HTTP address (optional)
 	Epoch       int64
 	LeaseExpiry time.Time
 }

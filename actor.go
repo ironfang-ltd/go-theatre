@@ -30,6 +30,9 @@ type Actor struct {
 	inbox           chan InboxMessage
 	shutdown        chan bool
 	lastMessage     int64
+	messagesTotal   int64 // total messages processed (atomic)
+	errorsTotal     int64 // total receive errors (atomic)
+	createdAt       int64 // unix seconds
 	status          int64
 	selfDeregister   bool        // true = onStop deregisters from actor registry
 	releaseOnStop    bool        // true = onDeactivate releases cluster ownership
@@ -50,6 +53,7 @@ func NewActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context,
 		receiver:    receiver,
 		inbox:       make(chan InboxMessage, inboxSize),
 		shutdown:    make(chan bool, 1),
+		createdAt:   coarseNow.Load(),
 		actorCtx:    actorCtx,
 		actorCancel: actorCancel,
 	}
@@ -126,6 +130,7 @@ func (a *Actor) Receive() {
 			}
 
 			atomic.StoreInt64(&a.lastMessage, coarseNow.Load())
+			atomic.AddInt64(&a.messagesTotal, 1)
 
 			ctx.SenderHostRef = msg.SenderHostRef
 			ctx.Message = msg.Body
@@ -141,6 +146,7 @@ func (a *Actor) Receive() {
 			}
 
 			if err != nil {
+				atomic.AddInt64(&a.errorsTotal, 1)
 				if errors.Is(err, ErrStopActor) {
 					selfStopped = true
 					return

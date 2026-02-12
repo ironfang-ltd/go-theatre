@@ -34,6 +34,9 @@ type hostConfig struct {
 	// Admin server address (e.g. "127.0.0.1:9090"). Empty = disabled.
 	adminAddr string
 
+	// Dashboard dev mode: reverse-proxy to Vite dev server on :3000.
+	dashboardDev bool
+
 	// Log level for the structured JSON logger. Default: slog.LevelInfo.
 	logLevel slog.Level
 
@@ -190,6 +193,15 @@ func WithPanicRecovery(enabled bool) Option {
 func WithScheduleRecoveryInterval(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.scheduleRecoveryInterval = d
+	}
+}
+
+// WithDashboardDev enables dashboard development mode, reverse-proxying
+// dashboard requests to the Vite dev server on localhost:3000 instead of
+// serving the embedded SPA assets.
+func WithDashboardDev() Option {
+	return func(c *hostConfig) {
+		c.dashboardDev = true
 	}
 }
 
