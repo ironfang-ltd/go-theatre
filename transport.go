@@ -172,6 +172,12 @@ type transportPeer struct {
 	address   string
 	connected atomic.Bool // lock-free connection check for SendTo fast path
 
+	// Per-peer counters for observability.
+	messagesSent     atomic.Int64
+	messagesReceived atomic.Int64
+	sendErrors       atomic.Int64
+	latencyUs        atomic.Int64 // last Ping/Pong RTT in microseconds
+
 	mu       sync.Mutex // guards conn lifecycle (writeFrame compat)
 	conn     net.Conn
 	outbound bool   // true if we dialed (getOrConnect); false if they dialed (handleInbound)
@@ -249,6 +255,41 @@ func (t *Transport) Stats() TransportStats {
 	return s
 }
 
+// PeerStats holds a snapshot of a single peer's transport state.
+type PeerStats struct {
+	HostID           string `json:"host_id"`
+	Address          string `json:"address"`
+	Connected        bool   `json:"connected"`
+	MessagesSent     int64  `json:"messages_sent"`
+	MessagesReceived int64  `json:"messages_received"`
+	SendErrors       int64  `json:"send_errors"`
+	SendQueue        int    `json:"send_queue"`
+	LatencyUs        int64  `json:"latency_us"`
+}
+
+// PeerSnapshots returns per-peer transport stats for all known peers.
+func (t *Transport) PeerSnapshots() []PeerStats {
+	var out []PeerStats
+	t.peers.Range(func(_, v any) bool {
+		p := v.(*transportPeer)
+		ps := PeerStats{
+			HostID:           p.hostID,
+			Address:          p.address,
+			Connected:        p.connected.Load(),
+			MessagesSent:     p.messagesSent.Load(),
+			MessagesReceived: p.messagesReceived.Load(),
+			SendErrors:       p.sendErrors.Load(),
+			LatencyUs:        p.latencyUs.Load(),
+		}
+		for _, ch := range p.sendChs {
+			ps.SendQueue += len(ch)
+		}
+		out = append(out, ps)
+		return true
+	})
+	return out
+}
+
 // Addr returns the listener's network address (useful when binding to ":0").
 func (t *Transport) Addr() string {
 	return t.listener.Addr().String()
@@ -267,6 +308,8 @@ func (t *Transport) PeerAddress(hostID string) string {
 func (t *Transport) Start() {
 	t.wg.Add(1)
 	go t.acceptLoop()
+	t.wg.Add(1)
+	go t.pingLoop()
 }
 
 // Stop closes all connections and the listener, then waits for goroutines to exit.
@@ -732,6 +775,7 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 		}
 
 		if writeErr != nil {
+			p.sendErrors.Add(1)
 			if useLane {
 				t.closeLaneConn(p, lane, conn)
 			} else {
@@ -771,6 +815,7 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 				writeErr = writeBatchFrameTo(conn, &frameBuf, batch[:n])
 			}
 			if writeErr != nil {
+				p.sendErrors.Add(1)
 				if useLane {
 					t.closeLaneConn(p, lane, conn)
 				} else {
@@ -782,6 +827,7 @@ func (t *Transport) peerWriter(p *transportPeer, lane int) {
 			}
 		}
 
+		p.messagesSent.Add(int64(n))
 		recycleEnvelopes(batch[:n])
 	}
 }
@@ -936,6 +982,7 @@ func (t *Transport) peerFlusher(p *transportPeer) {
 		_, writeErr := conn.Write(writeBuf)
 
 		if writeErr != nil {
+			p.sendErrors.Add(1)
 			t.closePeerConn(p, conn)
 			curConn = nil
 
@@ -956,6 +1003,7 @@ func (t *Transport) peerFlusher(p *transportPeer) {
 
 			_, writeErr = conn.Write(writeBuf)
 			if writeErr != nil {
+				p.sendErrors.Add(1)
 				t.closePeerConn(p, conn)
 				curConn = nil
 			}
@@ -1027,10 +1075,94 @@ func (t *Transport) closeLaneConn(p *transportPeer, lane int, conn net.Conn) {
 	lc.mu.Unlock()
 }
 
+// --- ping/pong ---
+
+// pingLoop periodically sends a TransportPing to all connected peers.
+// Runs until t.done is closed.
+func (t *Transport) pingLoop() {
+	defer t.wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-ticker.C:
+		}
+		now := time.Now().UnixMicro()
+		ping := TransportEnvelope{Tag: TagPing, Payload: &TransportPing{SentAt: now}}
+		t.peers.Range(func(_, v any) bool {
+			p := v.(*transportPeer)
+			if !p.connected.Load() || len(p.sendChs) == 0 {
+				return true
+			}
+			// Non-blocking send on lane 0 — drop if full.
+			select {
+			case p.sendChs[0] <- ping:
+			default:
+			}
+			return true
+		})
+	}
+}
+
+// handlePingPong intercepts Ping and Pong messages in readLoop. Returns
+// true if the envelope was handled (caller should skip normal dispatch).
+func (t *Transport) handlePingPong(p *transportPeer, env TransportEnvelope) bool {
+	switch env.Tag {
+	case TagPing:
+		msg := env.Payload.(*TransportPing)
+		pong := TransportEnvelope{Tag: TagPong, Payload: &TransportPong{EchoedAt: msg.SentAt}}
+		if len(p.sendChs) > 0 {
+			// Ensure writers are running so the Pong actually gets written.
+			p.writersOnce.Do(func() {
+				if p.laneConns != nil {
+					for i := range p.sendChs {
+						t.wg.Add(1)
+						go t.peerWriter(p, i)
+					}
+				} else if p.mergeCh != nil {
+					for i := range p.sendChs {
+						t.wg.Add(1)
+						go t.peerEncoder(p, i)
+					}
+					t.wg.Add(1)
+					go t.peerFlusher(p)
+				} else {
+					t.wg.Add(1)
+					go t.peerWriter(p, 0)
+				}
+			})
+			select {
+			case p.sendChs[0] <- pong:
+			default:
+			}
+		}
+		return true
+	case TagPong:
+		msg := env.Payload.(*TransportPong)
+		if msg.EchoedAt > 0 {
+			rtt := time.Now().UnixMicro() - msg.EchoedAt
+			if rtt < 1 {
+				rtt = 1 // sub-microsecond RTT, clamp to 1
+			}
+			p.latencyUs.Store(rtt)
+		}
+		return true
+	}
+	return false
+}
+
 // --- read loop ---
 
 func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 	bufReader := bufio.NewReaderSize(conn, 65536)
+
+	// Look up peer once for counter updates and ping/pong handling.
+	var peer *transportPeer
+	if v, ok := t.peers.Load(remoteID); ok {
+		peer = v.(*transportPeer)
+	}
 
 	// Throttle read deadline updates: the 30s deadline only needs refreshing
 	// every ~10s. Uses the coarse clock (clock.go) for a zero-cost check.
@@ -1096,12 +1228,19 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 			return
 		}
 
-		if t.handler == nil {
-			continue
-		}
-
 		if batchN > 0 {
+			if peer != nil {
+				peer.messagesReceived.Add(int64(batchN))
+			}
 			for i := 0; i < batchN; i++ {
+				if peer != nil && t.handlePingPong(peer, batchBuf[i]) {
+					batchBuf[i] = TransportEnvelope{}
+					continue
+				}
+				if t.handler == nil {
+					batchBuf[i] = TransportEnvelope{}
+					continue
+				}
 				if dispatchChs != nil && batchBuf[i].Tag == TagActorForward {
 					msg := batchBuf[i].Payload.(*ActorForward)
 					shard := refShard(Ref{Type: msg.ActorType, ID: msg.ActorID}) % uint32(nWorkers)
@@ -1113,6 +1252,15 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 				batchBuf[i] = TransportEnvelope{}
 			}
 		} else {
+			if peer != nil {
+				peer.messagesReceived.Add(1)
+			}
+			if peer != nil && t.handlePingPong(peer, env) {
+				continue
+			}
+			if t.handler == nil {
+				continue
+			}
 			if dispatchChs != nil && env.Tag == TagActorForward {
 				msg := env.Payload.(*ActorForward)
 				shard := refShard(Ref{Type: msg.ActorType, ID: msg.ActorID}) % uint32(nWorkers)

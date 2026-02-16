@@ -106,7 +106,7 @@ func main() {
 
 		opts := []theatre.Option{
 			theatre.WithAdminAddr(adminAddr),
-			theatre.WithIdleTimeout(5 * time.Minute),
+			theatre.WithIdleTimeout(60 * time.Second),
 			theatre.WithHostInboxSize(16384),
 			theatre.WithOutboxSize(16384),
 			theatre.WithOutboxWorkers(20),

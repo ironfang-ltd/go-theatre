@@ -1,6 +1,12 @@
 // playground-load generates traffic against a running playground cluster
 // so the dashboard shows live stats and actor activity.
 //
+// The workload uses a Zipf distribution over actor IDs, creating a realistic
+// pattern where a small "hot" set of actors receives most traffic while the
+// long tail of actors receives infrequent messages. Cold actors idle out and
+// get recreated when they receive another message, exercising the full actor
+// lifecycle (Initialize → process → idle timeout → Shutdown → re-Initialize).
+//
 // Usage:
 //
 //	go run ./cmd/playground          # start playground first
@@ -9,8 +15,9 @@
 // Flags:
 //
 //	-workers   concurrent sender goroutines (default 60)
-//	-actors    number of distinct actor IDs to target (default 1000)
-//	-req-pct   percentage of messages that are requests vs sends (default 30)
+//	-actors    actor ID pool size — Zipf distribution selects from this range (default 1000000)
+//	-req-pct   percentage of messages that are requests vs sends (default 50)
+//	-skew      Zipf skew parameter s>1 — higher = more concentrated on hot actors (default 1.2)
 //	-admin     admin address of any playground host (default 127.0.0.1:9090)
 //	-type      actor type to target (default "bench" — nop receiver, no stdout)
 package main
@@ -20,7 +27,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand/v2"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,12 +46,17 @@ func (nopReceiver) Receive(*theatre.Context) error { return nil }
 
 func main() {
 	workers := flag.Int("workers", 60, "number of concurrent sender goroutines")
-	actors := flag.Int("actors", 1000, "number of distinct actor IDs to target")
-	reqPct := flag.Int("req-pct", 30, "percentage of messages that are request/response (vs fire-and-forget)")
+	actors := flag.Int("actors", 1_000_000, "actor ID pool size (Zipf selects from this range)")
+	reqPct := flag.Int("req-pct", 50, "percentage of messages that are request/response (vs fire-and-forget)")
+	skew := flag.Float64("skew", 1.2, "Zipf skew parameter s>1 (higher = more concentrated on hot actors)")
 	admin := flag.String("admin", "127.0.0.1:9090", "admin address of any playground host")
 	actorType := flag.String("type", "bench", "actor type to target (bench=nop, echo=prints)")
 	memlimit := flag.Int64("memlimit", 2, "GOMEMLIMIT in GiB (0=disabled)")
 	flag.Parse()
+
+	if *skew <= 1.0 {
+		log.Fatal("skew must be > 1.0")
+	}
 
 	// GC tuning: disable percentage-based GC, only collect near memory limit.
 	if *memlimit > 0 {
@@ -146,22 +158,29 @@ func main() {
 	sendThreshold := float64(100-*reqPct) / 100.0
 
 	fmt.Printf("Load generator started (transport=%s)\n", t.Addr())
-	fmt.Printf("Workers: %d  Actors: %d  Type: %s  Request%%: %d%%  Lanes: %d  GOMEMLIMIT: %dGiB\n\n",
-		*workers, *actors, *actorType, *reqPct, lanes, *memlimit)
+	fmt.Printf("Workers: %d  Actors: %d  Type: %s  Request%%: %d%%  Skew: %.1f  Lanes: %d  GOMEMLIMIT: %dGiB\n\n",
+		*workers, *actors, *actorType, *reqPct, *skew, lanes, *memlimit)
 
 	// --- Stats ---
 
 	var sent, requested, replies, errors atomic.Int64
 
-	// --- Workers: tight loops matching the real loadtest ---
+	// --- Workers ---
+	// Each worker gets its own RNG and Zipf generator (no contention).
+	// Zipf(s=1.2) over 1M actors: top ~1K actors get most traffic,
+	// bottom ~900K get rare messages and churn through idle timeouts.
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 
-	for range *workers {
+	for i := range *workers {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
+
+			rng := rand.New(rand.NewSource(int64(workerID) ^ time.Now().UnixNano()))
+			zipf := rand.NewZipf(rng, *skew, 1, uint64(poolSize-1))
+
 			for {
 				select {
 				case <-stop:
@@ -169,9 +188,9 @@ func main() {
 				default:
 				}
 
-				ref := theatre.NewRef(*actorType, actorIDs[rand.IntN(poolSize)])
+				ref := theatre.NewRef(*actorType, actorIDs[zipf.Uint64()])
 
-				if rand.Float64() < sendThreshold {
+				if rng.Float64() < sendThreshold {
 					if err := h.Send(ref, "ping"); err != nil {
 						errors.Add(1)
 					} else {
@@ -186,7 +205,7 @@ func main() {
 					}
 				}
 			}
-		}()
+		}(i)
 	}
 
 	// --- Stats printer (every second) ---

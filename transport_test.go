@@ -299,7 +299,7 @@ func TestTransport_PeerAddressFromHandshake(t *testing.T) {
 	received := make(chan struct{}, 1)
 
 	handlerB := func(from string, env TransportEnvelope) {
-		if _, ok := env.Payload.(*TransportPing); ok {
+		if env.Tag == TagActorForward {
 			received <- struct{}{}
 		}
 	}
@@ -318,20 +318,20 @@ func TestTransport_PeerAddressFromHandshake(t *testing.T) {
 	tB.Start()
 	defer tB.Stop()
 
-	// A sends a ping to B, which establishes an outbound connection from A→B
+	// A sends a message to B, which establishes an outbound connection from A→B
 	// and an inbound connection on B from A.
-	pingEnv, err := Envelope(TransportPing{})
+	fwdEnv, err := Envelope(&ActorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
 	if err != nil {
 		t.Fatalf("Envelope: %v", err)
 	}
-	if err := tA.SendTo("host-b", tB.Addr(), pingEnv); err != nil {
+	if err := tA.SendTo("host-b", tB.Addr(), fwdEnv); err != nil {
 		t.Fatalf("SendTo: %v", err)
 	}
 
 	select {
 	case <-received:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for ping")
+		t.Fatal("timeout waiting for message")
 	}
 
 	// Check that B's peer entry for "host-a" has A's listen address,
@@ -361,12 +361,12 @@ func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
 	receivedB := make(chan struct{}, 10)
 
 	handlerA := func(from string, env TransportEnvelope) {
-		if _, ok := env.Payload.(*TransportPing); ok {
+		if env.Tag == TagActorForward {
 			receivedA <- struct{}{}
 		}
 	}
 	handlerB := func(from string, env TransportEnvelope) {
-		if _, ok := env.Payload.(*TransportPing); ok {
+		if env.Tag == TagActorForward {
 			receivedB <- struct{}{}
 		}
 	}
@@ -386,12 +386,15 @@ func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
 	tB.Start()
 	defer tB.Stop()
 
-	pingEnv, _ := Envelope(TransportPing{})
+	mkFwd := func(sender string) TransportEnvelope {
+		env, _ := Envelope(&ActorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: sender})
+		return env
+	}
 
 	// Trigger simultaneous connect: both sides dial at the same time.
 	errCh := make(chan error, 2)
-	go func() { errCh <- tA.SendTo("host-b", tB.Addr(), pingEnv) }()
-	go func() { errCh <- tB.SendTo("host-a", tA.Addr(), pingEnv) }()
+	go func() { errCh <- tA.SendTo("host-b", tB.Addr(), mkFwd("host-a")) }()
+	go func() { errCh <- tB.SendTo("host-a", tA.Addr(), mkFwd("host-b")) }()
 
 	// Both sends should succeed (possibly after one reconnect cycle).
 	for i := 0; i < 2; i++ {
@@ -400,19 +403,19 @@ func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
 		}
 	}
 
-	// Both sides should receive the ping.
+	// Both sides should receive the message.
 	for i := 0; i < 1; i++ {
 		select {
 		case <-receivedA:
 		case <-time.After(2 * time.Second):
-			t.Fatal("timeout waiting for ping on A")
+			t.Fatal("timeout waiting for message on A")
 		}
 	}
 	for i := 0; i < 1; i++ {
 		select {
 		case <-receivedB:
 		case <-time.After(2 * time.Second):
-			t.Fatal("timeout waiting for ping on B")
+			t.Fatal("timeout waiting for message on B")
 		}
 	}
 
@@ -420,22 +423,22 @@ func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Send another round — should work without errors on stable connections.
-	if err := tA.SendTo("host-b", tB.Addr(), pingEnv); err != nil {
+	if err := tA.SendTo("host-b", tB.Addr(), mkFwd("host-a")); err != nil {
 		t.Fatalf("second SendTo A→B: %v", err)
 	}
-	if err := tB.SendTo("host-a", tA.Addr(), pingEnv); err != nil {
+	if err := tB.SendTo("host-a", tA.Addr(), mkFwd("host-b")); err != nil {
 		t.Fatalf("second SendTo B→A: %v", err)
 	}
 
 	select {
 	case <-receivedB:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for second ping on B")
+		t.Fatal("timeout waiting for second message on B")
 	}
 	select {
 	case <-receivedA:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for second ping on A")
+		t.Fatal("timeout waiting for second message on A")
 	}
 }
 
@@ -563,43 +566,37 @@ func TestTransport_ForwardAndReply(t *testing.T) {
 }
 
 func TestTransport_PingPong(t *testing.T) {
-	pongCh := make(chan struct{}, 1)
-	pingCh := make(chan struct{}, 1)
+	// Ping/Pong is now handled automatically by the transport layer.
+	// Verify that sending a Ping results in latencyUs being populated
+	// on the sending peer after the Pong comes back.
 
-	var tB *Transport
+	nopHandler := func(from string, env TransportEnvelope) {}
 
-	handlerA := func(from string, env TransportEnvelope) {
-		if _, ok := env.Payload.(*TransportPong); ok {
-			pongCh <- struct{}{}
-		}
-	}
-
-	handlerB := func(from string, env TransportEnvelope) {
-		if _, ok := env.Payload.(*TransportPing); ok {
-			pingCh <- struct{}{}
-			env, err := Envelope(TransportPong{})
-			if err != nil {
-				return
-			}
-			tB.SendTo(from, "", env)
-		}
-	}
-
-	tA, err := NewTransport("host-a", "127.0.0.1:0", handlerA)
+	tA, err := NewTransport("host-a", "127.0.0.1:0", nopHandler)
 	if err != nil {
 		t.Fatalf("NewTransport A: %v", err)
 	}
 	tA.Start()
 	defer tA.Stop()
 
-	tB, err = NewTransport("host-b", "127.0.0.1:0", handlerB)
+	tB, err := NewTransport("host-b", "127.0.0.1:0", nopHandler)
 	if err != nil {
 		t.Fatalf("NewTransport B: %v", err)
 	}
 	tB.Start()
 	defer tB.Stop()
 
-	pingEnv, err := Envelope(TransportPing{})
+	// Establish connection by sending a regular message.
+	fwdEnv, _ := Envelope(&ActorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
+	if err := tA.SendTo("host-b", tB.Addr(), fwdEnv); err != nil {
+		t.Fatalf("SendTo: %v", err)
+	}
+
+	// Small delay to ensure connection is fully established on both sides.
+	time.Sleep(100 * time.Millisecond)
+
+	// Send a manual Ping and wait for latencyUs to populate.
+	pingEnv, err := Envelope(&TransportPing{SentAt: time.Now().UnixMicro()})
 	if err != nil {
 		t.Fatalf("Envelope ping: %v", err)
 	}
@@ -607,16 +604,21 @@ func TestTransport_PingPong(t *testing.T) {
 		t.Fatalf("SendTo ping: %v", err)
 	}
 
-	select {
-	case <-pingCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for ping")
-	}
-
-	select {
-	case <-pongCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for pong")
+	// Poll for latency to appear on tA's peer entry for host-b.
+	deadline := time.After(3 * time.Second)
+	for {
+		snaps := tA.PeerSnapshots()
+		for _, ps := range snaps {
+			if ps.HostID == "host-b" && ps.LatencyUs > 0 {
+				t.Logf("latency to host-b: %d us", ps.LatencyUs)
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for latency to populate")
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 

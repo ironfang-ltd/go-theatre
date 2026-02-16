@@ -26,6 +26,11 @@ type AdminServer struct {
 	host     *Host
 	server   *http.Server
 	listener net.Listener
+	done     chan struct{}
+
+	// Cached runtime.MemStats to avoid stop-the-world pauses on every
+	// status request. Updated every second by a background goroutine.
+	cachedMem atomic.Pointer[runtime.MemStats]
 }
 
 // NewAdminServer creates an AdminServer bound to the given address.
@@ -76,6 +81,14 @@ func (as *AdminServer) Addr() string {
 
 // Start begins serving HTTP requests. Non-blocking.
 func (as *AdminServer) Start() {
+	// Seed the cached memstats immediately so the first request has data.
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	as.cachedMem.Store(&mem)
+
+	as.done = make(chan struct{})
+	go as.memStatsLoop()
+
 	go func() {
 		if err := as.server.Serve(as.listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("admin server error", "error", err)
@@ -84,11 +97,39 @@ func (as *AdminServer) Start() {
 	slog.Info("admin server started", "addr", as.Addr())
 }
 
+// memStatsLoop refreshes cached MemStats every second.
+func (as *AdminServer) memStatsLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-as.done:
+			return
+		case <-ticker.C:
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			as.cachedMem.Store(&mem)
+		}
+	}
+}
+
 // Stop gracefully shuts down the admin server.
 func (as *AdminServer) Stop() {
+	close(as.done)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	as.server.Shutdown(ctx)
+}
+
+// memStats returns cached MemStats, falling back to a live read if the
+// background loop hasn't been started (e.g. direct handler tests).
+func (as *AdminServer) memStats() *runtime.MemStats {
+	if p := as.cachedMem.Load(); p != nil {
+		return p
+	}
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return &mem
 }
 
 // --- handlers ---
@@ -120,9 +161,10 @@ type clusterStatusResponse struct {
 	InboxCap    int `json:"inbox_cap"`
 
 	// Transport stats.
-	TransportPeers       int `json:"transport_peers"`
-	TransportConnections int `json:"transport_connections"`
-	TransportSendQueue   int `json:"transport_send_queue"`
+	TransportPeers       int         `json:"transport_peers"`
+	TransportConnections int         `json:"transport_connections"`
+	TransportSendQueue   int         `json:"transport_send_queue"`
+	TransportPeersDetail []PeerStats `json:"transport_peers_detail,omitempty"`
 }
 
 func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
@@ -145,9 +187,8 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	// Runtime stats.
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
+	// Use cached memstats to avoid stop-the-world pause per request.
+	mem := as.memStats()
 
 	resp := clusterStatusResponse{
 		HostID:           h.hostRef.String(),
@@ -174,6 +215,7 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 		resp.TransportPeers = ts.Peers
 		resp.TransportConnections = ts.Connections
 		resp.TransportSendQueue = ts.SendQueueDepth
+		resp.TransportPeersDetail = h.transport.PeerSnapshots()
 	}
 
 	if h.cluster != nil {
@@ -598,18 +640,19 @@ type allClusterStatusResponse struct {
 
 // perHostStatus is a summary of one host's runtime state.
 type perHostStatus struct {
-	HostID             string           `json:"host_id"`
-	State              string           `json:"state"`
-	ActiveActors       int              `json:"active_actors"`
-	Goroutines         int              `json:"goroutines"`
-	HeapAllocMB        float64          `json:"heap_alloc_mb"`
-	GCPauseUs          int64            `json:"gc_pause_us"`
-	OutboxDepth        int              `json:"outbox_depth"`
-	OutboxCap          int              `json:"outbox_cap"`
-	InboxDepth         int              `json:"inbox_depth"`
-	InboxCap           int              `json:"inbox_cap"`
+	HostID               string           `json:"host_id"`
+	State                string           `json:"state"`
+	ActiveActors         int              `json:"active_actors"`
+	Goroutines           int              `json:"goroutines"`
+	HeapAllocMB          float64          `json:"heap_alloc_mb"`
+	GCPauseUs            int64            `json:"gc_pause_us"`
+	OutboxDepth          int              `json:"outbox_depth"`
+	OutboxCap            int              `json:"outbox_cap"`
+	InboxDepth           int              `json:"inbox_depth"`
+	InboxCap             int              `json:"inbox_cap"`
 	TransportPeers       int              `json:"transport_peers"`
 	TransportSendQueue   int              `json:"transport_send_queue"`
+	TransportPeersDetail []PeerStats      `json:"transport_peers_detail,omitempty"`
 	PlacementCacheSize   int              `json:"placement_cache_size"`
 	Metrics              map[string]int64 `json:"metrics"`
 }
@@ -622,9 +665,8 @@ func (as *AdminServer) handleAllStatus(w http.ResponseWriter, r *http.Request) {
 
 	h := as.host
 
-	// Start with local status.
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
+	// Use cached memstats to avoid stop-the-world pause per request.
+	mem := as.memStats()
 
 	snap := h.metrics.Snapshot()
 	activeActors := h.actors.Count()
@@ -642,11 +684,13 @@ func (as *AdminServer) handleAllStatus(w http.ResponseWriter, r *http.Request) {
 	inboxDepth := len(h.inbox)
 	inboxCap := cap(h.inbox)
 	var transportPeers, transportConns, transportQueue int
+	var localPeersDetail []PeerStats
 	if h.transport != nil {
 		ts := h.transport.Stats()
 		transportPeers = ts.Peers
 		transportConns = ts.Connections
 		transportQueue = ts.SendQueueDepth
+		localPeersDetail = h.transport.PeerSnapshots()
 	}
 	localPlacementCacheSize := 0
 	if h.placementCache != nil {
@@ -664,18 +708,19 @@ func (as *AdminServer) handleAllStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hosts := []perHostStatus{{
-		HostID:             localID,
-		State:              state,
-		ActiveActors:       activeActors,
-		Goroutines:         goroutines,
-		HeapAllocMB:        heapAllocMB,
-		GCPauseUs:          gcPauseUs,
-		OutboxDepth:        outboxDepth,
-		OutboxCap:          outboxCap,
-		InboxDepth:         inboxDepth,
-		InboxCap:           inboxCap,
+		HostID:               localID,
+		State:                state,
+		ActiveActors:         activeActors,
+		Goroutines:           goroutines,
+		HeapAllocMB:          heapAllocMB,
+		GCPauseUs:            gcPauseUs,
+		OutboxDepth:          outboxDepth,
+		OutboxCap:            outboxCap,
+		InboxDepth:           inboxDepth,
+		InboxCap:             inboxCap,
 		TransportPeers:       transportPeers,
 		TransportSendQueue:   transportQueue,
+		TransportPeersDetail: localPeersDetail,
 		PlacementCacheSize:   localPlacementCacheSize,
 		Metrics:              h.metrics.Snapshot(),
 	}}
@@ -704,20 +749,21 @@ func (as *AdminServer) handleAllStatus(w http.ResponseWriter, r *http.Request) {
 			snap[k] += v
 		}
 		hosts = append(hosts, perHostStatus{
-			HostID:             hostID,
-			State:              remote.State,
-			ActiveActors:       remote.ActiveActors,
-			Goroutines:         remote.Goroutines,
-			HeapAllocMB:        remote.HeapAllocMB,
-			GCPauseUs:          remote.GCPauseUs,
-			OutboxDepth:        remote.OutboxDepth,
-			OutboxCap:          remote.OutboxCap,
-			InboxDepth:         remote.InboxDepth,
-			InboxCap:           remote.InboxCap,
-			TransportPeers:     remote.TransportPeers,
-			TransportSendQueue: remote.TransportSendQueue,
-			PlacementCacheSize: remote.PlacementCacheSize,
-			Metrics:            remote.Metrics,
+			HostID:               hostID,
+			State:                remote.State,
+			ActiveActors:         remote.ActiveActors,
+			Goroutines:           remote.Goroutines,
+			HeapAllocMB:          remote.HeapAllocMB,
+			GCPauseUs:            remote.GCPauseUs,
+			OutboxDepth:          remote.OutboxDepth,
+			OutboxCap:            remote.OutboxCap,
+			InboxDepth:           remote.InboxDepth,
+			InboxCap:             remote.InboxCap,
+			TransportPeers:       remote.TransportPeers,
+			TransportSendQueue:   remote.TransportSendQueue,
+			TransportPeersDetail: remote.TransportPeersDetail,
+			PlacementCacheSize:   remote.PlacementCacheSize,
+			Metrics:              remote.Metrics,
 		})
 	}
 

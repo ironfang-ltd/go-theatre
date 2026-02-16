@@ -29,9 +29,21 @@ export interface ClusterStatus {
   transport_peers: number
   transport_connections: number
   transport_send_queue: number
+  transport_peers_detail?: PeerStats[]
 
   // Per-host breakdown (only present in all-status).
   hosts?: PerHostStatus[]
+}
+
+export interface PeerStats {
+  host_id: string
+  address: string
+  connected: boolean
+  messages_sent: number
+  messages_received: number
+  send_errors: number
+  send_queue: number
+  latency_us: number
 }
 
 export interface PerHostStatus {
@@ -47,6 +59,7 @@ export interface PerHostStatus {
   inbox_cap: number
   transport_peers: number
   transport_send_queue: number
+  transport_peers_detail?: PeerStats[]
   metrics: Record<string, number>
 }
 

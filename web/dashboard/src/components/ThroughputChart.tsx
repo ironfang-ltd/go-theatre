@@ -21,6 +21,8 @@ function formatYAxis(value: number): string {
   return String(value)
 }
 
+const rateKeys = new Set(['recv', 'sent', 'deadLettered'])
+
 function CustomTooltip({ active, payload, label }: any) {
   if (!active || !payload?.length) return null
   return (
@@ -28,7 +30,8 @@ function CustomTooltip({ active, payload, label }: any) {
       <p className="text-zinc-400 mb-1">{label}</p>
       {payload.map((entry: any) => (
         <p key={entry.dataKey} style={{ color: entry.color }}>
-          {entry.name}: {formatNumber(entry.value)}/s
+          {entry.name}: {formatNumber(entry.value)}
+          {rateKeys.has(entry.dataKey) ? '/s' : ''}
         </p>
       ))}
     </div>
@@ -65,6 +68,15 @@ export default function ThroughputChart({ data }: Props) {
             stroke="#3f3f46"
           />
           <YAxis
+            yAxisId="left"
+            tickFormatter={formatYAxis}
+            tick={{ fill: '#71717a', fontSize: 11 }}
+            stroke="#3f3f46"
+            width={48}
+          />
+          <YAxis
+            yAxisId="right"
+            orientation="right"
             tickFormatter={formatYAxis}
             tick={{ fill: '#71717a', fontSize: 11 }}
             stroke="#3f3f46"
@@ -75,6 +87,7 @@ export default function ThroughputChart({ data }: Props) {
             wrapperStyle={{ fontSize: 12, color: '#a1a1aa' }}
           />
           <Line
+            yAxisId="left"
             type="monotone"
             dataKey="recv"
             name="Recv/s"
@@ -84,6 +97,7 @@ export default function ThroughputChart({ data }: Props) {
             isAnimationActive={false}
           />
           <Line
+            yAxisId="left"
             type="monotone"
             dataKey="sent"
             name="Sent/s"
@@ -93,10 +107,21 @@ export default function ThroughputChart({ data }: Props) {
             isAnimationActive={false}
           />
           <Line
+            yAxisId="left"
             type="monotone"
             dataKey="deadLettered"
             name="Dead/s"
             stroke="#f87171"
+            strokeWidth={1.5}
+            dot={false}
+            isAnimationActive={false}
+          />
+          <Line
+            yAxisId="right"
+            type="monotone"
+            dataKey="actors"
+            name="Actors"
+            stroke="#a78bfa"
             strokeWidth={1.5}
             dot={false}
             isAnimationActive={false}

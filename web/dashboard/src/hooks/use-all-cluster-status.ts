@@ -30,7 +30,7 @@ export function useAllClusterStatus() {
         for (const key of Object.keys(data.metrics)) {
           const prev = prevRef.current.metrics[key] ?? 0
           const curr = data.metrics[key] ?? 0
-          rates[key] = Math.round((curr - prev) / dt)
+          rates[key] = Math.max(0, Math.round((curr - prev) / dt))
         }
         ratesRef.current = rates
       }

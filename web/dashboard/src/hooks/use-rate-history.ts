@@ -7,6 +7,7 @@ export interface RateDataPoint {
   recv: number
   sent: number
   deadLettered: number
+  actors: number
 }
 
 // 5 minutes at 2-second intervals = 150 points.
@@ -34,6 +35,7 @@ function initHistory(): RateDataPoint[] {
       recv: 0,
       sent: 0,
       deadLettered: 0,
+      actors: 0,
     })
   }
   return points
@@ -60,6 +62,7 @@ export function useRateHistory() {
         recv: r.messages_received ?? 0,
         sent: r.messages_sent ?? 0,
         deadLettered: r.messages_dead_lettered ?? 0,
+        actors: status.active_actors ?? 0,
       },
     ]
   }, [])

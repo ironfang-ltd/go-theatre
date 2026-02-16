@@ -145,6 +145,12 @@ func (m *Host) Start() {
 		go m.scheduler.recoveryLoop()
 	}
 
+	// Proactively connect to all cluster peers so the transport
+	// has peer entries (and latency data) for every host.
+	if m.cluster != nil && m.transport != nil {
+		go m.connectPeers()
+	}
+
 	// Start admin server if configured.
 	if m.config.adminAddr != "" {
 		as, err := NewAdminServer(m, m.config.adminAddr)
@@ -157,13 +163,43 @@ func (m *Host) Start() {
 	}
 }
 
+// connectPeers periodically ensures this host has a transport connection
+// to every other live cluster member. This makes peer stats (latency, etc.)
+// visible on the admin dashboard even before any actor messages are exchanged.
+func (m *Host) connectPeers() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	connect := func() {
+		hosts := m.cluster.LiveHosts()
+		for _, h := range hosts {
+			if h.HostID == m.localHostID {
+				continue
+			}
+			ping := TransportEnvelope{
+				Tag:     TagPing,
+				Payload: &TransportPing{SentAt: time.Now().UnixMicro()},
+			}
+			_ = m.transport.SendTo(h.HostID, h.Address, ping)
+		}
+	}
+
+	// Initial connect attempt.
+	connect()
+
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			connect()
+		}
+	}
+}
+
 func (m *Host) Stop() {
 	m.stopOnce.Do(func() {
 		slog.Info("stopping", "host", m.hostRef.String())
-
-		if m.adminServer != nil {
-			m.adminServer.Stop()
-		}
 
 		// phase 1: set draining flag to reject new external messages
 		m.draining.Store(true)
@@ -186,6 +222,12 @@ func (m *Host) Stop() {
 		// Close the outbox channel to signal processOutbox goroutines to exit.
 		close(m.outbox)
 		m.outboxWg.Wait()
+
+		// phase 5: stop admin server last so the dashboard can observe
+		// the entire drain/shutdown process.
+		if m.adminServer != nil {
+			m.adminServer.Stop()
+		}
 	})
 }
 

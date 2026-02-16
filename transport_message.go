@@ -71,11 +71,17 @@ type HostFrozen struct {
 	Epoch     int64
 }
 
-// TransportPing is a liveness probe.
-type TransportPing struct{}
+// TransportPing is a liveness probe. SentAt carries the sender's
+// monotonic timestamp (UnixMicro) so the receiver can echo it back.
+type TransportPing struct {
+	SentAt int64
+}
 
-// TransportPong is the reply to a TransportPing.
-type TransportPong struct{}
+// TransportPong is the reply to a TransportPing. EchoedAt is copied
+// from the original Ping's SentAt so the sender can compute RTT.
+type TransportPong struct {
+	EchoedAt int64
+}
 
 // TransportEnvelope is a tagged transport-layer message.
 type TransportEnvelope struct {
@@ -297,7 +303,30 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 		putI64(buf, msg.Epoch)
 		return nil
 
-	case TagPing, TagPong:
+	case TagPing:
+		var msg *TransportPing
+		switch v := env.Payload.(type) {
+		case *TransportPing:
+			msg = v
+		case TransportPing:
+			msg = &v
+		default:
+			return fmt.Errorf("expected TransportPing, got %T", env.Payload)
+		}
+		putI64(buf, msg.SentAt)
+		return nil
+
+	case TagPong:
+		var msg *TransportPong
+		switch v := env.Payload.(type) {
+		case *TransportPong:
+			msg = v
+		case TransportPong:
+			msg = &v
+		default:
+			return fmt.Errorf("expected TransportPong, got %T", env.Payload)
+		}
+		putI64(buf, msg.EchoedAt)
 		return nil
 
 	default:
@@ -411,7 +440,27 @@ func appendEncodedPayload(dst []byte, env TransportEnvelope) ([]byte, error) {
 			encodeActorForwardReplyStr(dst, off, msg, bodyStr)
 			return dst, nil
 		}
-	case TagPing, TagPong:
+	case TagPing:
+		msg, ok := env.Payload.(*TransportPing)
+		if !ok {
+			if v, ok2 := env.Payload.(TransportPing); ok2 {
+				msg = &v
+			} else {
+				return dst, fmt.Errorf("expected TransportPing, got %T", env.Payload)
+			}
+		}
+		dst = binary.BigEndian.AppendUint64(dst, uint64(msg.SentAt))
+		return dst, nil
+	case TagPong:
+		msg, ok := env.Payload.(*TransportPong)
+		if !ok {
+			if v, ok2 := env.Payload.(TransportPong); ok2 {
+				msg = &v
+			} else {
+				return dst, fmt.Errorf("expected TransportPong, got %T", env.Payload)
+			}
+		}
+		dst = binary.BigEndian.AppendUint64(dst, uint64(msg.EchoedAt))
 		return dst, nil
 	}
 	// Slow path: rare types or non-string body. Use bytes.Buffer.
@@ -690,9 +739,17 @@ func decodePayload(tag byte, data []byte) (interface{}, error) {
 		return &msg, nil
 
 	case TagPing:
-		return &TransportPing{}, nil
+		var msg TransportPing
+		if len(data) >= 8 {
+			msg.SentAt = int64(binary.BigEndian.Uint64(data[:8]))
+		}
+		return &msg, nil
 	case TagPong:
-		return &TransportPong{}, nil
+		var msg TransportPong
+		if len(data) >= 8 {
+			msg.EchoedAt = int64(binary.BigEndian.Uint64(data[:8]))
+		}
+		return &msg, nil
 	case TagBatch:
 		return decodeBatchPayload(data)
 	default:
