@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -40,12 +41,24 @@ func (e *echoReceiver) Receive(ctx *theatre.Context) error {
 	case theatre.Shutdown:
 		fmt.Printf("  [%s/%s] shutting down\n", e.name, ctx.ActorRef.ID)
 	case string:
-		fmt.Printf("  [%s/%s] received: %q\n", e.name, ctx.ActorRef.ID, msg)
+		//fmt.Printf("  [%s/%s] received: %q\n", e.name, ctx.ActorRef.ID, msg)
 		ctx.Reply(fmt.Sprintf("echo from %s: %s", e.name, msg))
 	case time.Time:
 		fmt.Printf("  [%s/%s] tick at %s\n", e.name, ctx.ActorRef.ID, msg.Format("15:04:05"))
 	default:
 		fmt.Printf("  [%s/%s] received: %T %v\n", e.name, ctx.ActorRef.ID, msg, msg)
+	}
+	return nil
+}
+
+// benchReceiver is a no-op actor for load generation. It replies to strings
+// without printing, so it doesn't bottleneck on stdout like echoReceiver.
+type benchReceiver struct{}
+
+func (benchReceiver) Receive(ctx *theatre.Context) error {
+	switch msg := ctx.Message.(type) {
+	case string:
+		ctx.Reply(msg)
 	}
 	return nil
 }
@@ -70,6 +83,10 @@ func (tr *tickReceiver) Receive(ctx *theatre.Context) error {
 }
 
 func main() {
+	// GC tuning: reduce GC jitter under load.
+	debug.SetMemoryLimit(2 * 1024 * 1024 * 1024)
+	debug.SetGCPercent(-1)
+
 	const numHosts = 3
 
 	type node struct {
@@ -90,6 +107,11 @@ func main() {
 		opts := []theatre.Option{
 			theatre.WithAdminAddr(adminAddr),
 			theatre.WithIdleTimeout(5 * time.Minute),
+			theatre.WithHostInboxSize(16384),
+			theatre.WithOutboxSize(16384),
+			theatre.WithOutboxWorkers(20),
+			theatre.WithCleanupInterval(500 * time.Millisecond),
+			theatre.WithPanicRecovery(false),
 		}
 		if i == 0 {
 			opts = append(opts, theatre.WithDashboardDev())
@@ -102,12 +124,19 @@ func main() {
 		h.RegisterActor("ticker", func() theatre.Receiver {
 			return &tickReceiver{name: name}
 		})
+		h.RegisterActor("bench", func() theatre.Receiver {
+			return benchReceiver{}
+		})
 
 		// Create transport (bind to :0 for auto port).
+		// Multi-conn must be enabled on all hosts so that the load tool
+		// can open parallel connections per send lane.
 		t, err := theatre.NewTransport(hostID, "127.0.0.1:0", h.HandleTransportMessage)
 		if err != nil {
 			log.Fatalf("transport %s: %v", hostID, err)
 		}
+		t.SetSendLanes(4)
+		t.SetMultiConn(4)
 		t.Start()
 
 		nodes[i] = node{
@@ -165,11 +194,11 @@ func main() {
 	// Schedule a one-shot message on host-1, fires 30s after startup.
 	fmt.Println("--- Scheduling messages ---")
 	ref1 := theatre.NewRef("echo", "1")
-	id1, err := nodes[0].host.SendAfter(ref1, "delayed hello (30s)", 30*time.Second)
+	_, err := nodes[0].host.SendAfter(ref1, "delayed hello (30s)", 30*time.Second)
 	if err != nil {
 		log.Printf("SendAfter error: %v", err)
 	} else {
-		fmt.Printf("  host-1: scheduled one-shot in 30s (id=%d)\n", id1)
+		//fmt.Printf("  host-1: scheduled one-shot in 30s (id=%d)\n", id1)
 	}
 
 	// Schedule a recurring tick on host-1 via self-rescheduling SendAfter.
@@ -177,15 +206,15 @@ func main() {
 	if _, err := nodes[0].host.SendAfter(tickRef, time.Now(), 5*time.Second); err != nil {
 		log.Printf("SendAfter tick error: %v", err)
 	} else {
-		fmt.Printf("  host-1: recurring tick every 5s (actor ticker/1)\n")
+		//fmt.Printf("  host-1: recurring tick every 5s (actor ticker/1)\n")
 	}
 
 	// Schedule a cron job on host-2, fires every minute.
 	cronRef := theatre.NewRef("echo", "cron")
-	if id, err := nodes[1].host.SendCron(cronRef, "cron ping", "* * * * *"); err != nil {
+	if _, err := nodes[1].host.SendCron(cronRef, "cron ping", "* * * * *"); err != nil {
 		log.Printf("SendCron error: %v", err)
 	} else {
-		fmt.Printf("  host-2: cron every minute (id=%d, actor echo/cron)\n", id)
+		//fmt.Printf("  host-2: cron every minute (id=%d, actor echo/cron)\n", id)
 	}
 	fmt.Println()
 

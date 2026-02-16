@@ -225,6 +225,30 @@ func NewTransport(hostID, listenAddr string, handler TransportHandler) (*Transpo
 	}, nil
 }
 
+// TransportStats holds a snapshot of transport state for observability.
+type TransportStats struct {
+	Peers          int // number of known peers
+	Connections    int // number of connected peers
+	SendQueueDepth int // total messages queued across all peers/lanes
+}
+
+// Stats returns a snapshot of transport connectivity and queue state.
+func (t *Transport) Stats() TransportStats {
+	var s TransportStats
+	t.peers.Range(func(_, v any) bool {
+		p := v.(*transportPeer)
+		s.Peers++
+		if p.connected.Load() {
+			s.Connections++
+		}
+		for _, ch := range p.sendChs {
+			s.SendQueueDepth += len(ch)
+		}
+		return true
+	})
+	return s
+}
+
 // Addr returns the listener's network address (useful when binding to ":0").
 func (t *Transport) Addr() string {
 	return t.listener.Addr().String()
@@ -1057,7 +1081,7 @@ func (t *Transport) readLoop(remoteID string, conn net.Conn) {
 			case <-t.done:
 				// shutting down — expected
 			default:
-				slog.Warn("transport read error", "remote", remoteID, "error", err)
+				slog.Debug("transport read error", "remote", remoteID, "error", err)
 				// Clear the connection so the next SendTo reconnects.
 				if v, ok := t.peers.Load(remoteID); ok {
 					p := v.(*transportPeer)

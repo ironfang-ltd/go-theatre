@@ -11,6 +11,43 @@ export interface ClusterStatus {
   registered_types: string[] | null
   placement_cache_size: number
   metrics: Record<string, number>
+
+  // Runtime stats.
+  goroutines: number
+  heap_alloc_mb: number
+  heap_sys_mb: number
+  gc_pause_us: number
+  num_gc: number
+
+  // Channel depths (backpressure).
+  outbox_depth: number
+  outbox_cap: number
+  inbox_depth: number
+  inbox_cap: number
+
+  // Transport stats.
+  transport_peers: number
+  transport_connections: number
+  transport_send_queue: number
+
+  // Per-host breakdown (only present in all-status).
+  hosts?: PerHostStatus[]
+}
+
+export interface PerHostStatus {
+  host_id: string
+  state: string
+  active_actors: number
+  goroutines: number
+  heap_alloc_mb: number
+  gc_pause_us: number
+  outbox_depth: number
+  outbox_cap: number
+  inbox_depth: number
+  inbox_cap: number
+  transport_peers: number
+  transport_send_queue: number
+  metrics: Record<string, number>
 }
 
 export interface HostEntry {
@@ -32,10 +69,12 @@ export interface ActorEntry {
   last_message?: string
   inbox_size: number
   inbox_cap: number
+  host_id?: string
 }
 
 export interface ClusterActors {
   actors: ActorEntry[]
+  total: number
 }
 
 export interface ActorDetail {
@@ -75,43 +114,25 @@ export interface ClusterTypes {
   types: string[]
 }
 
-// fetchAllClusterSchedules fans out to every known host and merges results.
+// fetchAllClusterSchedules fetches cluster-wide schedules from the server-side aggregation endpoint.
 export async function fetchAllClusterSchedules(): Promise<ClusterSchedules> {
-  // Get host list from the local host.
-  const hostsRes = await fetch('/cluster/hosts')
-  if (!hostsRes.ok) throw new Error(`GET /cluster/hosts: ${hostsRes.status}`)
-  const hostsData: ClusterHosts = await hostsRes.json()
+  const res = await fetch('/cluster/all-schedules')
+  if (!res.ok) throw new Error(`GET /cluster/all-schedules: ${res.status}`)
+  return res.json()
+}
 
-  // Also get the local host ID so we can tag local schedules.
-  const statusRes = await fetch('/cluster/status')
-  if (!statusRes.ok) throw new Error(`GET /cluster/status: ${statusRes.status}`)
-  const statusData: ClusterStatus = await statusRes.json()
-
-  const hosts = hostsData.hosts ?? []
-  const allSchedules: ScheduleEntry[] = []
-
-  // Fan out to all hosts with admin addresses.
-  const fetches = hosts
-    .filter((h) => h.admin_addr)
-    .map(async (h) => {
-      try {
-        const url =
-          h.host_id === statusData.host_id
-            ? '/cluster/schedules' // local — use relative URL (works with proxy)
-            : `http://${h.admin_addr}/cluster/schedules`
-        const res = await fetch(url)
-        if (!res.ok) return
-        const data: ClusterSchedules = await res.json()
-        for (const s of data.schedules ?? []) {
-          allSchedules.push({ ...s, host_id: h.host_id })
-        }
-      } catch {
-        // Host unreachable — skip silently.
-      }
-    })
-
-  await Promise.all(fetches)
-  return { schedules: allSchedules }
+// fetchAllClusterActors fetches cluster-wide actors with server-side pagination.
+export async function fetchAllClusterActors(
+  limit: number = 50,
+  offset: number = 0,
+): Promise<ClusterActors> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  })
+  const res = await fetch(`/cluster/all-actors?${params}`)
+  if (!res.ok) throw new Error(`GET /cluster/all-actors: ${res.status}`)
+  return res.json()
 }
 
 export async function fetchClusterTypes(): Promise<ClusterTypes> {
@@ -139,6 +160,12 @@ export async function fetchClusterActors(): Promise<ClusterActors> {
 export async function fetchClusterStatus(): Promise<ClusterStatus> {
   const res = await fetch('/cluster/status')
   if (!res.ok) throw new Error(`GET /cluster/status: ${res.status}`)
+  return res.json()
+}
+
+export async function fetchAllClusterStatus(): Promise<ClusterStatus> {
+  const res = await fetch('/cluster/all-status')
+  if (!res.ok) throw new Error(`GET /cluster/all-status: ${res.status}`)
   return res.json()
 }
 

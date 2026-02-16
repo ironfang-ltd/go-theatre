@@ -191,6 +191,7 @@ func (m *Host) routeReply(msg OutboxMessage) {
 	// Local reply (standalone or same host).
 	if msg.recipientHostID == "" || m.transport == nil {
 		m.deliverLocal(msg)
+		m.metrics.MessagesSent.Add(1)
 		return
 	}
 
@@ -207,6 +208,8 @@ func (m *Host) routeReply(msg OutboxMessage) {
 		slog.Error("transport reply failed",
 			"recipientHostID", msg.recipientHostID, "error", err)
 		recyclePayload(env)
+	} else {
+		m.metrics.MessagesSent.Add(1)
 	}
 }
 

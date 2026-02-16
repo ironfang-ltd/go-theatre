@@ -2,16 +2,22 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { useState, useMemo } from 'react'
 import { useClusterActors } from '../../hooks/use-cluster-actors'
 import ActorStatusBadge from '../../components/ActorStatusBadge'
+import { formatNumber } from '../../lib/format'
 import type { ActorEntry } from '../../lib/api'
 
 export const Route = createFileRoute('/actors/')({
   component: ActorsPage,
 })
 
+const PAGE_SIZES = [10, 25, 50, 100] as const
+
 function ActorsPage() {
-  const { data, isLoading, error } = useClusterActors()
+  const [pageSize, setPageSize] = useState<number>(50)
+  const [offset, setOffset] = useState(0)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all')
+
+  const { data, isLoading, error } = useClusterActors(pageSize, offset)
 
   const filtered = useMemo(() => {
     if (!data?.actors) return []
@@ -30,13 +36,10 @@ function ActorsPage() {
       )
     }
 
-    return actors.sort((a, b) => {
-      const cmp = a.type.localeCompare(b.type)
-      return cmp !== 0 ? cmp : a.id.localeCompare(b.id)
-    })
+    return actors
   }, [data, search, statusFilter])
 
-  if (isLoading) {
+  if (isLoading && !data) {
     return <p className="text-zinc-500">Loading...</p>
   }
 
@@ -48,7 +51,16 @@ function ActorsPage() {
     )
   }
 
-  const total = data?.actors?.length ?? 0
+  const total = data?.total ?? 0
+  const page = Math.floor(offset / pageSize) + 1
+  const totalPages = Math.ceil(total / pageSize)
+  const showingFrom = total === 0 ? 0 : offset + 1
+  const showingTo = Math.min(offset + pageSize, total)
+
+  function goToPage(newPage: number) {
+    const newOffset = (newPage - 1) * pageSize
+    setOffset(Math.max(0, Math.min(newOffset, total - 1)))
+  }
 
   return (
     <div className="space-y-4">
@@ -56,9 +68,7 @@ function ActorsPage() {
         <h1 className="text-lg font-semibold text-zinc-100">
           Actors{' '}
           <span className="text-sm font-normal text-zinc-500">
-            {filtered.length === total
-              ? `(${total})`
-              : `(${filtered.length} / ${total})`}
+            ({formatNumber(total)})
           </span>
         </h1>
 
@@ -81,6 +91,20 @@ function ActorsPage() {
             <option value="active">Active</option>
             <option value="inactive">Inactive</option>
           </select>
+          <select
+            value={pageSize}
+            onChange={(e) => {
+              setPageSize(Number(e.target.value))
+              setOffset(0)
+            }}
+            className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-zinc-500"
+          >
+            {PAGE_SIZES.map((s) => (
+              <option key={s} value={s}>
+                {s} per page
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 
@@ -88,6 +112,35 @@ function ActorsPage() {
         <p className="text-zinc-500 text-sm">No actors match the filter.</p>
       ) : (
         <ActorsTable actors={filtered} />
+      )}
+
+      {/* Pagination */}
+      {total > 0 && (
+        <div className="flex items-center justify-between text-sm text-zinc-400">
+          <span>
+            Showing {formatNumber(showingFrom)}&ndash;{formatNumber(showingTo)} of{' '}
+            {formatNumber(total)}
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => goToPage(page - 1)}
+              disabled={page <= 1}
+              className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-300 hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Prev
+            </button>
+            <span className="text-zinc-500">
+              Page {page} of {totalPages}
+            </span>
+            <button
+              onClick={() => goToPage(page + 1)}
+              disabled={page >= totalPages}
+              className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-300 hover:bg-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Next
+            </button>
+          </div>
+        </div>
       )}
     </div>
   )
@@ -100,6 +153,7 @@ function ActorsTable({ actors }: { actors: ActorEntry[] }) {
         <thead className="border-b border-zinc-800 bg-zinc-900/50">
           <tr>
             <th className="px-4 py-3 font-medium text-zinc-400">Status</th>
+            <th className="px-4 py-3 font-medium text-zinc-400">Host</th>
             <th className="px-4 py-3 font-medium text-zinc-400">Type</th>
             <th className="px-4 py-3 font-medium text-zinc-400">ID</th>
             <th className="px-4 py-3 font-medium text-zinc-400">Inbox</th>
@@ -108,9 +162,12 @@ function ActorsTable({ actors }: { actors: ActorEntry[] }) {
         </thead>
         <tbody className="divide-y divide-zinc-800">
           {actors.map((a) => (
-            <tr key={`${a.type}:${a.id}`} className="bg-zinc-900">
+            <tr key={`${a.host_id}-${a.type}:${a.id}`} className="bg-zinc-900">
               <td className="whitespace-nowrap px-4 py-3">
                 <ActorStatusBadge status={a.status} />
+              </td>
+              <td className="whitespace-nowrap px-4 py-3 font-mono text-zinc-300">
+                {a.host_id ?? '—'}
               </td>
               <td className="whitespace-nowrap px-4 py-3 font-mono text-zinc-100">
                 <Link

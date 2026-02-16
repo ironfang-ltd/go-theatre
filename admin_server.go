@@ -5,11 +5,17 @@ import (
 	"encoding/json"
 	"expvar"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -47,6 +53,9 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 	mux.HandleFunc("/cluster/actor-detail", as.handleActorDetail)
 	mux.HandleFunc("/cluster/schedules", as.handleClusterSchedules)
 	mux.HandleFunc("/cluster/types", as.handleClusterTypes)
+	mux.HandleFunc("/cluster/all-status", as.handleAllStatus)
+	mux.HandleFunc("/cluster/all-schedules", as.handleAllSchedules)
+	mux.HandleFunc("/cluster/all-actors", as.handleAllActors)
 	mux.HandleFunc("/cluster/actor", as.handleClusterActor)
 	mux.HandleFunc("/cluster/local-actor", as.handleLocalActor)
 	mux.HandleFunc("/debug/vars", expvar.Handler().ServeHTTP)
@@ -96,6 +105,24 @@ type clusterStatusResponse struct {
 	RegisteredTypes    []string       `json:"registered_types"`
 	PlacementCacheSize int            `json:"placement_cache_size"`
 	Metrics            map[string]int64 `json:"metrics"`
+
+	// Runtime stats.
+	Goroutines  int     `json:"goroutines"`
+	HeapAllocMB float64 `json:"heap_alloc_mb"`
+	HeapSysMB   float64 `json:"heap_sys_mb"`
+	GCPauseUs   int64   `json:"gc_pause_us"` // last GC pause in microseconds
+	NumGC       int64   `json:"num_gc"`
+
+	// Channel depths (backpressure indicators).
+	OutboxDepth int `json:"outbox_depth"`
+	OutboxCap   int `json:"outbox_cap"`
+	InboxDepth  int `json:"inbox_depth"`
+	InboxCap    int `json:"inbox_cap"`
+
+	// Transport stats.
+	TransportPeers       int `json:"transport_peers"`
+	TransportConnections int `json:"transport_connections"`
+	TransportSendQueue   int `json:"transport_send_queue"`
 }
 
 func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +145,10 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Runtime stats.
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
 	resp := clusterStatusResponse{
 		HostID:           h.hostRef.String(),
 		State:            state,
@@ -125,6 +156,24 @@ func (as *AdminServer) handleClusterStatus(w http.ResponseWriter, r *http.Reques
 		PendingSchedules: h.scheduler.count(),
 		RegisteredTypes:  h.registeredTypes(),
 		Metrics:          h.metrics.Snapshot(),
+		Goroutines:       runtime.NumGoroutine(),
+		HeapAllocMB:      float64(mem.HeapAlloc) / (1024 * 1024),
+		HeapSysMB:        float64(mem.HeapSys) / (1024 * 1024),
+		NumGC:            int64(mem.NumGC),
+		OutboxDepth:      len(h.outbox),
+		OutboxCap:        cap(h.outbox),
+		InboxDepth:       len(h.inbox),
+		InboxCap:         cap(h.inbox),
+	}
+	if mem.NumGC > 0 {
+		resp.GCPauseUs = int64(mem.PauseNs[(mem.NumGC-1)%256]) / 1000
+	}
+
+	if h.transport != nil {
+		ts := h.transport.Stats()
+		resp.TransportPeers = ts.Peers
+		resp.TransportConnections = ts.Connections
+		resp.TransportSendQueue = ts.SendQueueDepth
 	}
 
 	if h.cluster != nil {
@@ -482,6 +531,486 @@ func (as *AdminServer) handleClusterTypes(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, clusterTypesResponse{Types: as.host.registeredTypes()})
+}
+
+// --- cluster-wide aggregation ---
+
+// fanOutGet issues parallel HTTP GETs to all remote hosts' admin addresses.
+// It returns a map of hostID → response body for reachable hosts.
+// The local host is excluded (identified by localHostID).
+func (as *AdminServer) fanOutGet(ctx context.Context, path string) map[string][]byte {
+	h := as.host
+	if h.cluster == nil {
+		return nil
+	}
+
+	localID := h.localHostID
+	if localID == "" {
+		localID = h.hostRef.String()
+	}
+
+	live := h.cluster.LiveHosts()
+	var mu sync.Mutex
+	results := make(map[string][]byte)
+	var wg sync.WaitGroup
+
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	for _, hi := range live {
+		if hi.AdminAddr == "" || hi.HostID == localID {
+			continue
+		}
+		wg.Add(1)
+		go func(hi HostInfo) {
+			defer wg.Done()
+			url := "http://" + hi.AdminAddr + path
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			results[hi.HostID] = body
+			mu.Unlock()
+		}(hi)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// allClusterStatusResponse extends the status response with per-host breakdowns.
+type allClusterStatusResponse struct {
+	clusterStatusResponse
+	Hosts []perHostStatus `json:"hosts,omitempty"`
+}
+
+// perHostStatus is a summary of one host's runtime state.
+type perHostStatus struct {
+	HostID             string           `json:"host_id"`
+	State              string           `json:"state"`
+	ActiveActors       int              `json:"active_actors"`
+	Goroutines         int              `json:"goroutines"`
+	HeapAllocMB        float64          `json:"heap_alloc_mb"`
+	GCPauseUs          int64            `json:"gc_pause_us"`
+	OutboxDepth        int              `json:"outbox_depth"`
+	OutboxCap          int              `json:"outbox_cap"`
+	InboxDepth         int              `json:"inbox_depth"`
+	InboxCap           int              `json:"inbox_cap"`
+	TransportPeers       int              `json:"transport_peers"`
+	TransportSendQueue   int              `json:"transport_send_queue"`
+	PlacementCacheSize   int              `json:"placement_cache_size"`
+	Metrics              map[string]int64 `json:"metrics"`
+}
+
+func (as *AdminServer) handleAllStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	h := as.host
+
+	// Start with local status.
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	snap := h.metrics.Snapshot()
+	activeActors := h.actors.Count()
+	pendingSchedules := h.scheduler.count()
+	goroutines := runtime.NumGoroutine()
+	heapAllocMB := float64(mem.HeapAlloc) / (1024 * 1024)
+	heapSysMB := float64(mem.HeapSys) / (1024 * 1024)
+	numGC := int64(mem.NumGC)
+	var gcPauseUs int64
+	if mem.NumGC > 0 {
+		gcPauseUs = int64(mem.PauseNs[(mem.NumGC-1)%256]) / 1000
+	}
+	outboxDepth := len(h.outbox)
+	outboxCap := cap(h.outbox)
+	inboxDepth := len(h.inbox)
+	inboxCap := cap(h.inbox)
+	var transportPeers, transportConns, transportQueue int
+	if h.transport != nil {
+		ts := h.transport.Stats()
+		transportPeers = ts.Peers
+		transportConns = ts.Connections
+		transportQueue = ts.SendQueueDepth
+	}
+	localPlacementCacheSize := 0
+	if h.placementCache != nil {
+		localPlacementCacheSize = h.placementCache.Len()
+	}
+
+	localID := h.localHostID
+	if localID == "" {
+		localID = h.hostRef.String()
+	}
+
+	state := "standalone"
+	if h.cluster != nil {
+		state = "clustered"
+	}
+
+	hosts := []perHostStatus{{
+		HostID:             localID,
+		State:              state,
+		ActiveActors:       activeActors,
+		Goroutines:         goroutines,
+		HeapAllocMB:        heapAllocMB,
+		GCPauseUs:          gcPauseUs,
+		OutboxDepth:        outboxDepth,
+		OutboxCap:          outboxCap,
+		InboxDepth:         inboxDepth,
+		InboxCap:           inboxCap,
+		TransportPeers:       transportPeers,
+		TransportSendQueue:   transportQueue,
+		PlacementCacheSize:   localPlacementCacheSize,
+		Metrics:              h.metrics.Snapshot(),
+	}}
+
+	// Fan-out to all remote hosts' /cluster/status and sum.
+	remotes := as.fanOutGet(r.Context(), "/cluster/status")
+	for hostID, body := range remotes {
+		var remote clusterStatusResponse
+		if err := json.Unmarshal(body, &remote); err != nil {
+			continue
+		}
+		activeActors += remote.ActiveActors
+		pendingSchedules += remote.PendingSchedules
+		goroutines += remote.Goroutines
+		heapAllocMB += remote.HeapAllocMB
+		heapSysMB += remote.HeapSysMB
+		numGC += remote.NumGC
+		outboxDepth += remote.OutboxDepth
+		outboxCap += remote.OutboxCap
+		inboxDepth += remote.InboxDepth
+		inboxCap += remote.InboxCap
+		transportPeers += remote.TransportPeers
+		transportConns += remote.TransportConnections
+		transportQueue += remote.TransportSendQueue
+		for k, v := range remote.Metrics {
+			snap[k] += v
+		}
+		hosts = append(hosts, perHostStatus{
+			HostID:             hostID,
+			State:              remote.State,
+			ActiveActors:       remote.ActiveActors,
+			Goroutines:         remote.Goroutines,
+			HeapAllocMB:        remote.HeapAllocMB,
+			GCPauseUs:          remote.GCPauseUs,
+			OutboxDepth:        remote.OutboxDepth,
+			OutboxCap:          remote.OutboxCap,
+			InboxDepth:         remote.InboxDepth,
+			InboxCap:           remote.InboxCap,
+			TransportPeers:     remote.TransportPeers,
+			TransportSendQueue: remote.TransportSendQueue,
+			PlacementCacheSize: remote.PlacementCacheSize,
+			Metrics:            remote.Metrics,
+		})
+	}
+
+	resp := allClusterStatusResponse{
+		clusterStatusResponse: clusterStatusResponse{
+			HostID:               h.hostRef.String(),
+			State:                state,
+			ActiveActors:         activeActors,
+			PendingSchedules:     pendingSchedules,
+			RegisteredTypes:      h.registeredTypes(),
+			Metrics:              snap,
+			Goroutines:           goroutines,
+			HeapAllocMB:          heapAllocMB,
+			HeapSysMB:            heapSysMB,
+			GCPauseUs:            gcPauseUs,
+			NumGC:                numGC,
+			OutboxDepth:          outboxDepth,
+			OutboxCap:            outboxCap,
+			InboxDepth:           inboxDepth,
+			InboxCap:             inboxCap,
+			TransportPeers:       transportPeers,
+			TransportConnections: transportConns,
+			TransportSendQueue:   transportQueue,
+		},
+		Hosts: hosts,
+	}
+
+	// Stable sort by host ID so the frontend doesn't jump around.
+	slices.SortFunc(resp.Hosts, func(a, b perHostStatus) int {
+		return strings.Compare(a.HostID, b.HostID)
+	})
+
+	if h.cluster != nil {
+		resp.Epoch = h.cluster.LocalEpoch()
+		resp.RemainingLeaseMs = h.cluster.RemainingLease().Milliseconds()
+		resp.RenewalFailures = h.cluster.ConsecutiveRenewalFailures()
+	}
+	// Sum placement cache size from all hosts (local is already in hosts[0]).
+	var placementCacheSize int
+	for _, ph := range hosts {
+		placementCacheSize += ph.PlacementCacheSize
+	}
+	resp.PlacementCacheSize = placementCacheSize
+
+	writeJSON(w, resp)
+}
+
+// allScheduleEntry is like scheduleEntry but always includes host_id.
+type allScheduleEntry struct {
+	ID        int64  `json:"id"`
+	ActorType string `json:"actor_type"`
+	ActorID   string `json:"actor_id"`
+	Body      string `json:"body"`
+	Kind      string `json:"kind"`
+	CronExpr  string `json:"cron_expr,omitempty"`
+	NextFire  string `json:"next_fire"`
+	HostID    string `json:"host_id"`
+}
+
+type allSchedulesResponse struct {
+	Schedules []allScheduleEntry `json:"schedules"`
+}
+
+func (as *AdminServer) handleAllSchedules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	h := as.host
+
+	// DB path: query the schedules table directly.
+	if h.cluster != nil && h.cluster.DB() != nil {
+		rows, err := h.cluster.DB().QueryContext(r.Context(),
+			`SELECT schedule_id, actor_type, actor_id, body, cron_expr, next_fire, one_shot, created_by
+			 FROM schedules ORDER BY next_fire`)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var entries []allScheduleEntry
+		for rows.Next() {
+			var (
+				id        int64
+				actorType string
+				actorID   string
+				body      []byte
+				cronExpr  *string
+				nextFire  time.Time
+				oneShot   bool
+				createdBy string
+			)
+			if err := rows.Scan(&id, &actorType, &actorID, &body, &cronExpr, &nextFire, &oneShot, &createdBy); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			kind := "cron"
+			if oneShot {
+				kind = "one-shot"
+			}
+			e := allScheduleEntry{
+				ID:        id,
+				ActorType: actorType,
+				ActorID:   actorID,
+				Body:      fmt.Sprintf("%s", body),
+				Kind:      kind,
+				NextFire:  nextFire.Format(time.RFC3339),
+				HostID:    createdBy,
+			}
+			if cronExpr != nil {
+				e.CronExpr = *cronExpr
+			}
+			entries = append(entries, e)
+		}
+		if entries == nil {
+			entries = []allScheduleEntry{}
+		}
+		writeJSON(w, allSchedulesResponse{Schedules: entries})
+		return
+	}
+
+	// Fan-out path: collect local + remote schedules.
+	localID := h.localHostID
+	if localID == "" {
+		localID = h.hostRef.String()
+	}
+
+	// Local schedules.
+	infos := h.scheduler.list()
+	entries := make([]allScheduleEntry, 0, len(infos))
+	for _, s := range infos {
+		kind := "cron"
+		if s.OneShot {
+			kind = "one-shot"
+		}
+		entries = append(entries, allScheduleEntry{
+			ID:        int64(s.ID),
+			ActorType: s.Ref.Type,
+			ActorID:   s.Ref.ID,
+			Body:      s.Body,
+			Kind:      kind,
+			CronExpr:  s.CronExpr,
+			NextFire:  s.NextFire.Format(time.RFC3339),
+			HostID:    localID,
+		})
+	}
+
+	// Remote schedules.
+	remotes := as.fanOutGet(r.Context(), "/cluster/schedules")
+	for hostID, body := range remotes {
+		var resp clusterSchedulesResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			continue
+		}
+		for _, s := range resp.Schedules {
+			entries = append(entries, allScheduleEntry{
+				ID:        s.ID,
+				ActorType: s.ActorType,
+				ActorID:   s.ActorID,
+				Body:      s.Body,
+				Kind:      s.Kind,
+				CronExpr:  s.CronExpr,
+				NextFire:  s.NextFire,
+				HostID:    hostID,
+			})
+		}
+	}
+
+	writeJSON(w, allSchedulesResponse{Schedules: entries})
+}
+
+// allActorEntry is like actorEntry but includes host_id.
+type allActorEntry struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	Status      string `json:"status"`
+	LastMessage string `json:"last_message,omitempty"`
+	InboxSize   int    `json:"inbox_size"`
+	InboxCap    int    `json:"inbox_cap"`
+	HostID      string `json:"host_id"`
+}
+
+type allActorsResponse struct {
+	Actors []allActorEntry `json:"actors"`
+	Total  int             `json:"total"`
+}
+
+func (as *AdminServer) handleAllActors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	limit := 50
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	offset := 0
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	h := as.host
+	localID := h.localHostID
+	if localID == "" {
+		localID = h.hostRef.String()
+	}
+
+	// Local actors.
+	actors := h.actors.All()
+	entries := make([]allActorEntry, 0, len(actors))
+	for _, a := range actors {
+		status := "active"
+		if a.GetStatus() != ActorStatusActive {
+			status = "inactive"
+		}
+		e := allActorEntry{
+			Type:      a.ref.Type,
+			ID:        a.ref.ID,
+			Status:    status,
+			InboxSize: len(a.inbox),
+			InboxCap:  cap(a.inbox),
+			HostID:    localID,
+		}
+		if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
+			e.LastMessage = lastMsg.Format(time.RFC3339)
+		}
+		entries = append(entries, e)
+	}
+
+	// Remote actors via fan-out.
+	remotes := as.fanOutGet(r.Context(), "/cluster/actors")
+	for hostID, body := range remotes {
+		var resp clusterActorsResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			continue
+		}
+		for _, a := range resp.Actors {
+			entries = append(entries, allActorEntry{
+				Type:        a.Type,
+				ID:          a.ID,
+				Status:      a.Status,
+				LastMessage: a.LastMessage,
+				InboxSize:   a.InboxSize,
+				InboxCap:    a.InboxCap,
+				HostID:      hostID,
+			})
+		}
+	}
+
+	total := len(entries)
+
+	// Sort: newest first (most recent last_message), then by type/id for stability.
+	slices.SortFunc(entries, func(a, b allActorEntry) int {
+		// Entries without a timestamp sort last.
+		switch {
+		case a.LastMessage == "" && b.LastMessage == "":
+			// fall through to type/id
+		case a.LastMessage == "":
+			return 1
+		case b.LastMessage == "":
+			return -1
+		default:
+			if c := strings.Compare(b.LastMessage, a.LastMessage); c != 0 {
+				return c // descending
+			}
+		}
+		if c := strings.Compare(a.HostID, b.HostID); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Type, b.Type); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+
+	// Paginate.
+	if offset > len(entries) {
+		offset = len(entries)
+	}
+	entries = entries[offset:]
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+
+	writeJSON(w, allActorsResponse{Actors: entries, Total: total})
 }
 
 // --- helpers ---

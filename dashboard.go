@@ -3,9 +3,11 @@ package theatre
 import (
 	"embed"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 )
 
 //go:embed all:web/dashboard/dist
@@ -18,7 +20,17 @@ var dashboardDist embed.FS
 func dashboardHandler(devProxy bool) http.Handler {
 	if devProxy {
 		target, _ := url.Parse("http://localhost:3000")
-		return httputil.NewSingleHostReverseProxy(target)
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		// Share a single transport with keep-alive to avoid ephemeral port
+		// exhaustion on Windows (default transport can leak TIME_WAIT sockets
+		// under heavy polling).
+		proxy.Transport = &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     60 * time.Second,
+		}
+		return proxy
 	}
 
 	dist, _ := fs.Sub(dashboardDist, "web/dashboard/dist")

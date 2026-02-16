@@ -1,10 +1,10 @@
 import { useQuery } from '@tanstack/react-query'
-import { fetchClusterActors } from '../lib/api'
+import { fetchAllClusterActors } from '../lib/api'
 
-export function useClusterActors() {
+export function useClusterActors(limit: number = 50, offset: number = 0) {
   return useQuery({
-    queryKey: ['cluster-actors'],
-    queryFn: fetchClusterActors,
+    queryKey: ['cluster-actors', limit, offset],
+    queryFn: () => fetchAllClusterActors(limit, offset),
     refetchInterval: 2000,
   })
 }
