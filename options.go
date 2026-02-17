@@ -45,6 +45,10 @@ type hostConfig struct {
 	// Scheduler recovery interval for overdue DB schedules (cluster mode).
 	scheduleRecoveryInterval time.Duration
 
+	// Background task limits.
+	maxTasksPerActor int           // max concurrent tasks per actor (default 4)
+	maxTaskDuration  time.Duration // per-task timeout (default 30min)
+
 	// Test hooks (nil in production).
 	postClaimHook func(Ref) // called after successful ownership claim, before actor start
 }
@@ -66,6 +70,8 @@ func defaultHostConfig() hostConfig {
 		outboxSize:         4096,
 		panicRecovery:              true,
 		scheduleRecoveryInterval:   10 * time.Second,
+		maxTasksPerActor:           4,
+		maxTaskDuration:            30 * time.Minute,
 	}
 }
 
@@ -215,6 +221,22 @@ func WithScheduleRecoveryInterval(d time.Duration) Option {
 func WithDashboardDev() Option {
 	return func(c *hostConfig) {
 		c.dashboardDev = true
+	}
+}
+
+// WithMaxTasksPerActor sets the maximum number of concurrent background tasks
+// each actor can run. Default: 4.
+func WithMaxTasksPerActor(n int) Option {
+	return func(c *hostConfig) {
+		c.maxTasksPerActor = n
+	}
+}
+
+// WithMaxTaskDuration sets the maximum duration for a background task before
+// its context is cancelled. Default: 30 minutes.
+func WithMaxTaskDuration(d time.Duration) Option {
+	return func(c *hostConfig) {
+		c.maxTaskDuration = d
 	}
 }
 

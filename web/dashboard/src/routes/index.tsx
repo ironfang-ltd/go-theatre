@@ -248,6 +248,27 @@ function Dashboard() {
           />
         </DetailCard>
 
+        {/* Background Tasks */}
+        <DetailCard title="Background Tasks">
+          <Row
+            label="Spawned"
+            value={formatNumber(m.tasks_spawned ?? 0)}
+            detail={rateStr(r.tasks_spawned)}
+            mono
+          />
+          <Row
+            label="Completed"
+            value={formatNumber(m.tasks_completed ?? 0)}
+            detail={rateStr(r.tasks_completed)}
+            mono
+          />
+          <Row
+            label="Failed"
+            value={formatNumber(m.tasks_failed ?? 0)}
+            mono
+          />
+        </DetailCard>
+
         {/* Placement Cache */}
         <DetailCard title="Placement Cache">
           <Row

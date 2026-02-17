@@ -8,6 +8,7 @@ export interface RateDataPoint {
   sent: number
   deadLettered: number
   actors: number
+  tasks: number
 }
 
 // 5 minutes at 2-second intervals = 150 points.
@@ -36,6 +37,7 @@ function initHistory(): RateDataPoint[] {
       sent: 0,
       deadLettered: 0,
       actors: 0,
+      tasks: 0,
     })
   }
   return points
@@ -52,7 +54,11 @@ export function useRateHistory() {
 
   const push = useCallback((status: ClusterStatusWithRates) => {
     const r = status.rates
+    const m = status.metrics
     const now = new Date()
+
+    const runningTasks =
+      (m.tasks_spawned ?? 0) - (m.tasks_completed ?? 0) - (m.tasks_failed ?? 0)
 
     historyRef.current = [
       ...historyRef.current.slice(-(MAX_POINTS - 1)),
@@ -63,6 +69,7 @@ export function useRateHistory() {
         sent: r.messages_sent ?? 0,
         deadLettered: r.messages_dead_lettered ?? 0,
         actors: status.active_actors ?? 0,
+        tasks: Math.max(0, runningTasks),
       },
     ]
   }, [])

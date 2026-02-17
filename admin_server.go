@@ -275,14 +275,23 @@ func (as *AdminServer) handleClusterHosts(w http.ResponseWriter, r *http.Request
 	writeJSON(w, clusterHostsResponse{Hosts: entries})
 }
 
+// taskInfoJSON is a single running task in actor detail responses.
+type taskInfoJSON struct {
+	TaskID    int64  `json:"task_id"`
+	Name      string `json:"name,omitempty"`
+	StartedAt string `json:"started_at"`
+	RunningMs int64  `json:"running_ms"`
+}
+
 // actorEntry is a single actor in the GET /cluster/actors response.
 type actorEntry struct {
-	Type        string `json:"type"`
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	LastMessage string `json:"last_message,omitempty"`
-	InboxSize   int    `json:"inbox_size"`
-	InboxCap    int    `json:"inbox_cap"`
+	Type         string `json:"type"`
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	LastMessage  string `json:"last_message,omitempty"`
+	InboxSize    int    `json:"inbox_size"`
+	InboxCap     int    `json:"inbox_cap"`
+	RunningTasks int    `json:"running_tasks"`
 }
 
 // clusterActorsResponse is the JSON structure for GET /cluster/actors.
@@ -304,11 +313,12 @@ func (as *AdminServer) handleClusterActors(w http.ResponseWriter, r *http.Reques
 			status = "inactive"
 		}
 		e := actorEntry{
-			Type:      a.ref.Type,
-			ID:        a.ref.ID,
-			Status:    status,
-			InboxSize: len(a.inbox),
-			InboxCap:  cap(a.inbox),
+			Type:         a.ref.Type,
+			ID:           a.ref.ID,
+			Status:       status,
+			InboxSize:    len(a.inbox),
+			InboxCap:     cap(a.inbox),
+			RunningTasks: int(a.runningTasks.Load()),
 		}
 		if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
 			e.LastMessage = lastMsg.Format(time.RFC3339)
@@ -442,6 +452,10 @@ type actorDetailResponse struct {
 	InboxSize     int    `json:"inbox_size,omitempty"`
 	InboxCap      int    `json:"inbox_cap,omitempty"`
 
+	// Background tasks.
+	RunningTasks int            `json:"running_tasks"`
+	Tasks        []taskInfoJSON `json:"tasks,omitempty"`
+
 	// Cluster ownership (if available).
 	OwnerHost string `json:"owner_host,omitempty"`
 	OwnerAddr string `json:"owner_addr,omitempty"`
@@ -567,6 +581,21 @@ func (as *AdminServer) buildActorDetail(a *Actor, actorType, actorID string) act
 	resp.ErrorsTotal = atomic.LoadInt64(&a.errorsTotal)
 	resp.InboxSize = len(a.inbox)
 	resp.InboxCap = cap(a.inbox)
+
+	resp.RunningTasks = int(a.runningTasks.Load())
+	if snap := a.TaskSnapshot(); len(snap) > 0 {
+		now := time.Now()
+		resp.Tasks = make([]taskInfoJSON, len(snap))
+		for i, ti := range snap {
+			resp.Tasks[i] = taskInfoJSON{
+				TaskID:    ti.ID,
+				Name:      ti.Name,
+				StartedAt: ti.StartedAt.Format(time.RFC3339),
+				RunningMs: now.Sub(ti.StartedAt).Milliseconds(),
+			}
+		}
+	}
+
 	return resp
 }
 
@@ -1010,13 +1039,14 @@ func (as *AdminServer) handleAllSchedules(w http.ResponseWriter, r *http.Request
 
 // allActorEntry is like actorEntry but includes host_id.
 type allActorEntry struct {
-	Type        string `json:"type"`
-	ID          string `json:"id"`
-	Status      string `json:"status"`
-	LastMessage string `json:"last_message,omitempty"`
-	InboxSize   int    `json:"inbox_size"`
-	InboxCap    int    `json:"inbox_cap"`
-	HostID      string `json:"host_id"`
+	Type         string `json:"type"`
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	LastMessage  string `json:"last_message,omitempty"`
+	InboxSize    int    `json:"inbox_size"`
+	InboxCap     int    `json:"inbox_cap"`
+	RunningTasks int    `json:"running_tasks"`
+	HostID       string `json:"host_id"`
 }
 
 type allActorsResponse struct {
@@ -1059,12 +1089,13 @@ func (as *AdminServer) handleAllActors(w http.ResponseWriter, r *http.Request) {
 			status = "inactive"
 		}
 		e := allActorEntry{
-			Type:      a.ref.Type,
-			ID:        a.ref.ID,
-			Status:    status,
-			InboxSize: len(a.inbox),
-			InboxCap:  cap(a.inbox),
-			HostID:    localID,
+			Type:         a.ref.Type,
+			ID:           a.ref.ID,
+			Status:       status,
+			InboxSize:    len(a.inbox),
+			InboxCap:     cap(a.inbox),
+			RunningTasks: int(a.runningTasks.Load()),
+			HostID:       localID,
 		}
 		if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
 			e.LastMessage = lastMsg.Format(time.RFC3339)
@@ -1081,13 +1112,14 @@ func (as *AdminServer) handleAllActors(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, a := range resp.Actors {
 			entries = append(entries, allActorEntry{
-				Type:        a.Type,
-				ID:          a.ID,
-				Status:      a.Status,
-				LastMessage: a.LastMessage,
-				InboxSize:   a.InboxSize,
-				InboxCap:    a.InboxCap,
-				HostID:      hostID,
+				Type:         a.Type,
+				ID:           a.ID,
+				Status:       a.Status,
+				LastMessage:  a.LastMessage,
+				InboxSize:    a.InboxSize,
+				InboxCap:     a.InboxCap,
+				RunningTasks: a.RunningTasks,
+				HostID:       hostID,
 			})
 		}
 	}

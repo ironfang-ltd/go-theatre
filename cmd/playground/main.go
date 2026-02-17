@@ -51,6 +51,31 @@ func (e *echoReceiver) Receive(ctx *theatre.Context) error {
 	return nil
 }
 
+// workerReceiver spawns a 15-second background task every 30 seconds.
+type workerReceiver struct{}
+
+func (workerReceiver) Receive(ctx *theatre.Context) error {
+	switch ctx.Message.(type) {
+	case theatre.Initialize:
+		ctx.SendAfter(ctx.ActorRef, "spawn", 1*time.Second)
+	case string:
+		ctx.SpawnNamedTask("background-job", func(tc *theatre.TaskContext) (any, error) {
+			select {
+			case <-time.After(15 * time.Second):
+				return "done", nil
+			case <-tc.Ctx.Done():
+				return nil, tc.Ctx.Err()
+			}
+		})
+		ctx.SendAfter(ctx.ActorRef, "spawn", 30*time.Second)
+	case theatre.TaskCompleted:
+		// task finished
+	case theatre.TaskFailed:
+		// task failed
+	}
+	return nil
+}
+
 // benchReceiver is a no-op actor for load generation. It replies to strings
 // without printing, so it doesn't bottleneck on stdout like echoReceiver.
 type benchReceiver struct{}
@@ -127,6 +152,9 @@ func main() {
 		h.RegisterActor("bench", func() theatre.Receiver {
 			return benchReceiver{}
 		})
+		h.RegisterActor("worker", func() theatre.Receiver {
+			return workerReceiver{}
+		})
 
 		// Create transport (bind to :0 for auto port).
 		// Multi-conn must be enabled on all hosts so that the load tool
@@ -178,6 +206,15 @@ func main() {
 	}
 
 	fmt.Println()
+
+	// Start a worker actor on each host (spawns tasks periodically).
+	fmt.Println("--- Starting worker actors ---")
+	for i, n := range nodes {
+		ref := theatre.NewRef("worker", fmt.Sprintf("%d", i+1))
+		if err := n.host.Send(ref, "init"); err != nil {
+			log.Printf("worker send error: %v", err)
+		}
+	}
 
 	// Send some fire-and-forget messages.
 	fmt.Println("--- Sending messages ---")

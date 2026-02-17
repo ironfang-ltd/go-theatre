@@ -152,10 +152,11 @@ function ActorsTable({ actors }: { actors: ActorEntry[] }) {
         <thead className="border-b border-zinc-800 bg-zinc-900/50">
           <tr>
             <th className="px-4 py-3 font-medium text-zinc-400">Status</th>
+            <th className="px-4 py-3 font-medium text-zinc-400">ID</th>
             <th className="px-4 py-3 font-medium text-zinc-400">Host</th>
             <th className="px-4 py-3 font-medium text-zinc-400">Type</th>
-            <th className="px-4 py-3 font-medium text-zinc-400">ID</th>
             <th className="px-4 py-3 font-medium text-zinc-400">Inbox</th>
+            <th className="px-4 py-3 font-medium text-zinc-400">Tasks</th>
             <th className="px-4 py-3 font-medium text-zinc-400">Last Message</th>
           </tr>
         </thead>
@@ -164,6 +165,15 @@ function ActorsTable({ actors }: { actors: ActorEntry[] }) {
             <tr key={`${a.host_id}-${a.type}:${a.id}`} className="bg-zinc-900">
               <td className="whitespace-nowrap px-4 py-3">
                 <ActorStatusBadge status={a.status} />
+              </td>
+              <td className="whitespace-nowrap px-4 py-3 font-mono text-zinc-100">
+                <Link
+                  to="/actors/$type/$id"
+                  params={{ type: a.type, id: a.id }}
+                  className="hover:text-white hover:underline"
+                >
+                  {a.id}
+                </Link>
               </td>
               <td className="whitespace-nowrap px-4 py-3 font-mono text-zinc-300">
                 {a.host_id ?? '—'}
@@ -177,17 +187,17 @@ function ActorsTable({ actors }: { actors: ActorEntry[] }) {
                   {a.type}
                 </Link>
               </td>
-              <td className="whitespace-nowrap px-4 py-3 font-mono text-zinc-100">
-                <Link
-                  to="/actors/$type/$id"
-                  params={{ type: a.type, id: a.id }}
-                  className="hover:text-white hover:underline"
-                >
-                  {a.id}
-                </Link>
-              </td>
               <td className="whitespace-nowrap px-4 py-3 text-zinc-300">
                 {a.inbox_size} / {a.inbox_cap}
+              </td>
+              <td className="whitespace-nowrap px-4 py-3 text-zinc-300">
+                {a.running_tasks > 0 ? (
+                  <span className="inline-flex items-center rounded-full bg-sky-500/15 border border-sky-500/25 px-2 py-0.5 text-xs font-medium text-sky-400">
+                    {a.running_tasks}
+                  </span>
+                ) : (
+                  '—'
+                )}
               </td>
               <td className="whitespace-nowrap px-4 py-3 text-zinc-300">
                 {a.last_message

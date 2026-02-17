@@ -2,6 +2,7 @@ package theatre
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -23,6 +24,7 @@ type Context struct {
 	Ctx context.Context
 
 	host    *Host
+	actor   *Actor
 	replyId int64
 
 	// Remote routing: set when message came from a remote host.
@@ -57,6 +59,24 @@ func (c *Context) SendCron(ref Ref, body interface{}, cronExpr string) (Schedule
 // CancelSchedule removes a scheduled message.
 func (c *Context) CancelSchedule(id ScheduleID) error {
 	return c.host.CancelSchedule(id)
+}
+
+// SpawnTask launches a background goroutine that can perform long-running work
+// without blocking the actor's receive loop. The function receives a TaskContext
+// with Send/Request capabilities and a cancellable context. On completion, the
+// actor receives a TaskCompleted or TaskFailed message. Returns the task ID.
+func (c *Context) SpawnTask(fn func(*TaskContext) (any, error)) (int64, error) {
+	return c.actor.spawnTask("", fn)
+}
+
+// SpawnNamedTask is like SpawnTask but assigns a name to the task. If a task
+// with the same name is already running on this actor, ErrTaskAlreadyRunning
+// is returned. The name is included in TaskCompleted/TaskFailed messages.
+func (c *Context) SpawnNamedTask(name string, fn func(*TaskContext) (any, error)) (int64, error) {
+	if name == "" {
+		return 0, fmt.Errorf("task name must not be empty")
+	}
+	return c.actor.spawnTask(name, fn)
 }
 
 // Reply sends a response back to the caller of a Request. For fire-and-forget

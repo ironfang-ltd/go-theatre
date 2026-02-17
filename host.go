@@ -631,6 +631,8 @@ func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 	a.noPanicRecovery = !m.config.panicRecovery
 	a.selfDeregister = true
 	a.releaseOnStop = true
+	a.maxTasks = m.config.maxTasksPerActor
+	a.maxTaskDur = m.config.maxTaskDuration
 	go a.Receive()
 
 	a.Send(InboxMessage{

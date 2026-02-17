@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -47,6 +48,13 @@ type Actor struct {
 	releaseOnStop    bool        // true = onDeactivate releases cluster ownership
 	onDeactivateHook func(Ref)   // test-only; nil in production (no alloc)
 	noPanicRecovery bool
+
+	// Background tasks.
+	runningTasks atomic.Int32    // concurrent task count
+	taskSeq      atomic.Int64   // monotonic task ID generator
+	maxTasks     int            // from host config (default 4)
+	maxTaskDur   time.Duration  // from host config (default 30min)
+	tasks        sync.Map       // taskID (int64) → *taskInfo
 
 	// Context derived from the host's freezeCtx. Cancelled when the host
 	// enters frozen state so the actor can exit cleanly.
@@ -97,6 +105,10 @@ func (a *Actor) Receive() {
 
 	defer (func() {
 
+		// Cancel actor context to signal all background tasks to stop.
+		// Idempotent: ForceStop may have already called this.
+		a.actorCancel()
+
 		slog.Debug("actor shutting down", "type", a.ref.Type, "id", a.ref.ID)
 
 		atomic.CompareAndSwapInt64(&a.status, int64(ActorStatusActive), int64(ActorStatusInactive))
@@ -123,6 +135,7 @@ func (a *Actor) Receive() {
 		ActorRef: a.ref,
 		host:     a.host,
 		Ctx:      a.actorCtx,
+		actor:    a,
 	}
 
 	for {

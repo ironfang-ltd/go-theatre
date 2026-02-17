@@ -79,6 +79,9 @@ func (am *actorRegistry) RemoveIdle(idleTimeout time.Duration) {
 		s := &am.shards[i]
 		s.mu.Lock()
 		for ref, a := range s.m {
+			if a.runningTasks.Load() > 0 {
+				continue
+			}
 			if time.Since(a.GetLastMessageTime()) > idleTimeout {
 				slog.Info("actor idle, shutting down", "type", ref.Type, "id", ref.ID)
 				delete(s.m, ref)

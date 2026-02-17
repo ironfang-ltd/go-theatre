@@ -82,12 +82,20 @@ export interface ActorEntry {
   last_message?: string
   inbox_size: number
   inbox_cap: number
+  running_tasks: number
   host_id?: string
 }
 
 export interface ClusterActors {
   actors: ActorEntry[]
   total: number
+}
+
+export interface TaskInfo {
+  task_id: number
+  name?: string
+  started_at: string
+  running_ms: number
 }
 
 export interface ActorDetail {
@@ -103,6 +111,8 @@ export interface ActorDetail {
   errors_total?: number
   inbox_size?: number
   inbox_cap?: number
+  running_tasks?: number
+  tasks?: TaskInfo[]
   owner_host?: string
   owner_addr?: string
   epoch?: number

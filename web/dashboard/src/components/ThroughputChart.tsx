@@ -126,6 +126,16 @@ export default function ThroughputChart({ data }: Props) {
             dot={false}
             isAnimationActive={false}
           />
+          <Line
+            yAxisId="right"
+            type="monotone"
+            dataKey="tasks"
+            name="Tasks"
+            stroke="#38bdf8"
+            strokeWidth={1.5}
+            dot={false}
+            isAnimationActive={false}
+          />
         </LineChart>
       </ResponsiveContainer>
     </div>

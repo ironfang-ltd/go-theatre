@@ -32,6 +32,10 @@ type Metrics struct {
 	PlacementCacheHits   atomic.Int64
 	PlacementCacheMisses atomic.Int64
 
+	TasksSpawned   atomic.Int64
+	TasksCompleted atomic.Int64
+	TasksFailed    atomic.Int64
+
 	ErrorsRecorded atomic.Int64
 
 	// actorCountFn returns the current number of active actors.
@@ -66,6 +70,9 @@ func newMetrics() *Metrics {
 	publish("freeze_count", atomicVar(&m.FreezeCount))
 	publish("placement_cache_hits", atomicVar(&m.PlacementCacheHits))
 	publish("placement_cache_misses", atomicVar(&m.PlacementCacheMisses))
+	publish("tasks_spawned", atomicVar(&m.TasksSpawned))
+	publish("tasks_completed", atomicVar(&m.TasksCompleted))
+	publish("tasks_failed", atomicVar(&m.TasksFailed))
 	publish("errors_recorded", atomicVar(&m.ErrorsRecorded))
 	publish("actors_active", expvar.Func(func() any {
 		if m.actorCountFn != nil {
@@ -100,6 +107,9 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		"freeze_count":           m.FreezeCount.Load(),
 		"placement_cache_hits":   m.PlacementCacheHits.Load(),
 		"placement_cache_misses": m.PlacementCacheMisses.Load(),
+		"tasks_spawned":          m.TasksSpawned.Load(),
+		"tasks_completed":        m.TasksCompleted.Load(),
+		"tasks_failed":           m.TasksFailed.Load(),
 		"errors_recorded":        m.ErrorsRecorded.Load(),
 	}
 	if m.actorCountFn != nil {

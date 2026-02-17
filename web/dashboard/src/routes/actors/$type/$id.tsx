@@ -192,6 +192,41 @@ function ActorDetailPage() {
           )}
         </DetailCard>
 
+        {/* Background Tasks */}
+        <DetailCard title="Background Tasks">
+          <Row
+            label="Running"
+            value={data.running_tasks ?? 0}
+            mono
+          />
+          {data.tasks && data.tasks.length > 0 && (
+            <div className="px-4 py-2.5">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-zinc-800">
+                    <th className="pb-1 font-medium text-zinc-500">Task</th>
+                    <th className="pb-1 font-medium text-zinc-500">Started</th>
+                    <th className="pb-1 font-medium text-zinc-500">Running</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/50">
+                  {data.tasks.map((t) => (
+                    <tr key={t.task_id}>
+                      <td className="py-1 font-mono text-zinc-300">{t.name || `#${t.task_id}`}</td>
+                      <td className="py-1 text-zinc-400">
+                        {new Date(t.started_at).toLocaleTimeString()}
+                      </td>
+                      <td className="py-1 font-mono text-zinc-300">
+                        {formatDuration(t.running_ms)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </DetailCard>
+
         {/* Cluster Ownership */}
         {(data.owner_host || data.owner_addr || data.epoch) && (
           <DetailCard title="Cluster Ownership">
