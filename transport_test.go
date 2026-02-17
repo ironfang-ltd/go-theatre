@@ -731,6 +731,144 @@ func TestTransport_CustomBodyType(t *testing.T) {
 	}
 }
 
+// --- error reporting ---
+
+func TestTransport_ReportError_OnReadError(t *testing.T) {
+	// When a peer's connection is closed unexpectedly, the readLoop should
+	// invoke the onError callback with the read error (e.g. EOF).
+	var (
+		gotMsg    string
+		gotRemote string
+		gotDetail string
+		reported  = make(chan struct{}, 1)
+	)
+
+	tA, err := NewTransport("host-a", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTransport A: %v", err)
+	}
+	tA.SetOnError(func(message, remoteID, detail string) {
+		gotMsg = message
+		gotRemote = remoteID
+		gotDetail = detail
+		select {
+		case reported <- struct{}{}:
+		default:
+		}
+	})
+	tA.Start()
+	defer tA.Stop()
+
+	tB, err := NewTransport("host-b", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTransport B: %v", err)
+	}
+	tB.Start()
+
+	// Establish connection A → B.
+	env := testEnvelope(actorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
+	if err := tA.SendTo("host-b", tB.Addr(), env); err != nil {
+		t.Fatalf("SendTo: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Abruptly stop B — A's readLoop should get an error (EOF/connection reset).
+	tB.Stop()
+
+	select {
+	case <-reported:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for onError callback")
+	}
+
+	if gotMsg != "read error" {
+		t.Errorf("message = %q, want %q", gotMsg, "read error")
+	}
+	if gotRemote != "host-b" {
+		t.Errorf("remoteID = %q, want %q", gotRemote, "host-b")
+	}
+	if gotDetail == "" {
+		t.Error("detail is empty, expected error text")
+	}
+}
+
+func TestTransport_ReportError_IgnoresTimeout(t *testing.T) {
+	// Read timeouts are expected keepalive behavior and should NOT trigger
+	// the onError callback.
+	errorCount := 0
+	tA, err := NewTransport("host-a", "127.0.0.1:0", nil,
+		WithTransportReadTimeout(100*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewTransport A: %v", err)
+	}
+	tA.SetOnError(func(_, _, _ string) {
+		errorCount++
+	})
+	tA.Start()
+	defer tA.Stop()
+
+	tB, err := NewTransport("host-b", "127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("NewTransport B: %v", err)
+	}
+	tB.Start()
+	defer tB.Stop()
+
+	// Establish connection, then let it sit idle past the read timeout.
+	env := testEnvelope(actorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
+	if err := tA.SendTo("host-b", tB.Addr(), env); err != nil {
+		t.Fatalf("SendTo: %v", err)
+	}
+
+	// Wait longer than the read timeout so it fires.
+	time.Sleep(500 * time.Millisecond)
+
+	if errorCount > 0 {
+		t.Errorf("onError called %d times for timeout, expected 0", errorCount)
+	}
+}
+
+func TestTransport_SetTransport_WiresErrorsToHost(t *testing.T) {
+	// SetTransport should wire transport errors into the host's errorLog.
+	host := NewHost()
+
+	tr, err := NewTransport("host-a", "127.0.0.1:0", host.HandleTransportMessage)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+	host.SetTransport(tr)
+
+	// Manually trigger reportError to verify the wiring.
+	tr.reportError("write error", "host-b", "broken pipe")
+
+	entries := host.errorLog.Recent(10)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 error entry, got %d", len(entries))
+	}
+
+	e := entries[0]
+	if e.Source != "transport" {
+		t.Errorf("Source = %q, want %q", e.Source, "transport")
+	}
+	if e.Message != "write error (peer host-b)" {
+		t.Errorf("Message = %q, want %q", e.Message, "write error (peer host-b)")
+	}
+	if e.Detail != "broken pipe" {
+		t.Errorf("Detail = %q, want %q", e.Detail, "broken pipe")
+	}
+
+	// Without remoteID, message should not include peer suffix.
+	tr.reportError("accept error", "", "use of closed connection")
+	entries = host.errorLog.Recent(10)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].Message != "accept error" {
+		t.Errorf("Message = %q, want %q", entries[0].Message, "accept error")
+	}
+}
+
 // --- benchmarks ---
 
 // benchmarkMessages returns the set of envelopes used across benchmarks.

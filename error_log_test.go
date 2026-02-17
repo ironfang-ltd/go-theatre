@@ -1,6 +1,8 @@
 package theatre
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -93,5 +95,53 @@ func TestErrorLog_LimitedRecent(t *testing.T) {
 		if got[i].Message != want {
 			t.Errorf("got[%d].Message = %q, want %q", i, got[i].Message, want)
 		}
+	}
+}
+
+func TestErrorLog_Concurrent(t *testing.T) {
+	el := newErrorLog(64)
+	const writers = 8
+	const perWriter = 200
+
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for w := range writers {
+		go func() {
+			defer wg.Done()
+			for i := range perWriter {
+				el.Record(ErrorEntry{
+					Time:    time.Now(),
+					Level:   "error",
+					Source:  fmt.Sprintf("w%d", w),
+					Message: fmt.Sprintf("msg-%d", i),
+				})
+			}
+		}()
+	}
+
+	// Concurrent readers while writers are active.
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				el.Recent(10)
+				el.Total()
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+
+	if el.Total() != writers*perWriter {
+		t.Errorf("Total = %d, want %d", el.Total(), writers*perWriter)
+	}
+
+	got := el.Recent(64)
+	if len(got) != 64 {
+		t.Errorf("Recent(64) returned %d entries, want 64", len(got))
 	}
 }
