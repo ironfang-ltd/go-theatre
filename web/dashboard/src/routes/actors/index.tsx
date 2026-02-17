@@ -2,6 +2,7 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { useState, useMemo } from 'react'
 import { useClusterActors } from '../../hooks/use-cluster-actors'
 import ActorStatusBadge from '../../components/ActorStatusBadge'
+import Select from '../../components/Select'
 import { formatNumber } from '../../lib/format'
 import type { ActorEntry } from '../../lib/api'
 
@@ -80,31 +81,29 @@ function ActorsPage() {
             placeholder="Filter by type or id..."
             className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-zinc-500"
           />
-          <select
+          <Select
             value={statusFilter}
             onChange={(e) =>
               setStatusFilter(e.target.value as 'all' | 'active' | 'inactive')
             }
-            className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-zinc-500"
           >
             <option value="all">All statuses</option>
             <option value="active">Active</option>
             <option value="inactive">Inactive</option>
-          </select>
-          <select
+          </Select>
+          <Select
             value={pageSize}
             onChange={(e) => {
               setPageSize(Number(e.target.value))
               setOffset(0)
             }}
-            className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-zinc-500"
           >
             {PAGE_SIZES.map((s) => (
               <option key={s} value={s}>
                 {s} per page
               </option>
             ))}
-          </select>
+          </Select>
         </div>
       </div>
 

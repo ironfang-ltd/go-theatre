@@ -32,6 +32,8 @@ type Metrics struct {
 	PlacementCacheHits   atomic.Int64
 	PlacementCacheMisses atomic.Int64
 
+	ErrorsRecorded atomic.Int64
+
 	// actorCountFn returns the current number of active actors.
 	// Set by Host at init time.
 	actorCountFn func() int
@@ -64,6 +66,7 @@ func newMetrics() *Metrics {
 	publish("freeze_count", atomicVar(&m.FreezeCount))
 	publish("placement_cache_hits", atomicVar(&m.PlacementCacheHits))
 	publish("placement_cache_misses", atomicVar(&m.PlacementCacheMisses))
+	publish("errors_recorded", atomicVar(&m.ErrorsRecorded))
 	publish("actors_active", expvar.Func(func() any {
 		if m.actorCountFn != nil {
 			return m.actorCountFn()
@@ -97,6 +100,7 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		"freeze_count":           m.FreezeCount.Load(),
 		"placement_cache_hits":   m.PlacementCacheHits.Load(),
 		"placement_cache_misses": m.PlacementCacheMisses.Load(),
+		"errors_recorded":        m.ErrorsRecorded.Load(),
 	}
 	if m.actorCountFn != nil {
 		snap["actors_active"] = int64(m.actorCountFn())

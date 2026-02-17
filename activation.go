@@ -10,8 +10,8 @@ import (
 // ErrClaimLost is returned when another host holds valid ownership for an actor.
 var ErrClaimLost = fmt.Errorf("ownership claim lost to another host")
 
-// ClaimResult describes the outcome of a claimOwnership call.
-type ClaimResult struct {
+// claimResult describes the outcome of a claimOwnership call.
+type claimResult struct {
 	OwnerHostID string
 	OwnerEpoch  int64
 	Won         bool
@@ -96,12 +96,12 @@ func (m *Host) activateActor(ref Ref, claim bool) (*Actor, error) {
 // Uses INSERT ... ON CONFLICT DO UPDATE with a WHERE guard that only
 // allows the update when no live host currently owns the actor.
 // Returns the claim result indicating whether this host won.
-func (m *Host) claimOwnership(ref Ref) (*ClaimResult, error) {
+func (m *Host) claimOwnership(ref Ref) (*claimResult, error) {
 	if m.cluster == nil {
 		return nil, nil
 	}
 	if m.cluster.DB() == nil {
-		return &ClaimResult{
+		return &claimResult{
 			OwnerHostID: m.cluster.LocalHostID(),
 			OwnerEpoch:  m.cluster.LocalEpoch(),
 			Won:         true,
@@ -147,7 +147,7 @@ func (m *Host) claimOwnership(ref Ref) (*ClaimResult, error) {
 			return nil, resolveErr
 		}
 		if owner != nil {
-			return &ClaimResult{
+			return &claimResult{
 				OwnerHostID: owner.HostID,
 				OwnerEpoch:  owner.Epoch,
 				Won:         false,
@@ -171,7 +171,7 @@ func (m *Host) claimOwnership(ref Ref) (*ClaimResult, error) {
 		reason = ActivationFailover
 	}
 
-	return &ClaimResult{
+	return &claimResult{
 		OwnerHostID: ownerHostID,
 		OwnerEpoch:  ownerEpoch,
 		Won:         won,
@@ -196,5 +196,6 @@ func (m *Host) releaseOwnership(ref Ref) {
 	`, ref.Type, ref.ID, hostID, epoch)
 	if err != nil {
 		slog.Error("release ownership failed", "ref", ref, "error", err)
+		m.recordError("activation", "release ownership failed", err.Error())
 	}
 }

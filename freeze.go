@@ -10,7 +10,7 @@ import (
 // explicitly or by the freeze monitor when lease health degrades.
 //
 // Sequence:
-//  1. Set frozen flag → Send/Request return ErrHostFrozen, ActorForward responds HostFrozen.
+//  1. Set frozen flag → Send/Request return ErrHostFrozen, actorForward responds hostFrozen.
 //  2. Cancel freezeCtx → all actor contexts are cancelled.
 //  3. Timeout all pending requests with ErrHostFrozen.
 //  4. Wait grace period for actors to exit cleanly.
@@ -22,6 +22,7 @@ func (m *Host) Freeze() {
 	}
 
 	slog.Warn("host entering frozen state", "host", m.hostRef.String())
+	m.recordWarn("freeze", "host entering frozen state", m.hostRef.String())
 
 	// Step 1: Set frozen flag. From this point, Send/Request return ErrHostFrozen.
 	m.frozen.Store(true)
@@ -90,6 +91,7 @@ func (m *Host) Unfreeze() error {
 		// Attempt a lease renewal to confirm we're still valid.
 		if err := m.cluster.renewLease(context.Background()); err != nil {
 			slog.Error("unfreeze: lease renewal failed", "error", err)
+			m.recordError("freeze", "unfreeze lease renewal failed", err.Error())
 			return ErrHostFrozen
 		}
 
@@ -164,6 +166,7 @@ func (m *Host) freezeMonitor() {
 // Best-effort release of ownership rows, close transport listener, then stop.
 func (m *Host) startDrain() {
 	slog.Warn("host entering drain state (lease expired)", "host", m.hostRef.String())
+	m.recordWarn("freeze", "host entering drain state (lease expired)", m.hostRef.String())
 
 	// Best-effort release of all ownership rows.
 	if m.cluster != nil && m.cluster.DB() != nil {
@@ -175,6 +178,7 @@ func (m *Host) startDrain() {
 		`, hostID, epoch)
 		if err != nil {
 			slog.Error("drain: failed to release ownership rows", "error", err)
+			m.recordError("freeze", "drain: failed to release ownership rows", err.Error())
 		} else {
 			slog.Info("drain: released ownership rows", "hostID", hostID, "epoch", epoch)
 		}

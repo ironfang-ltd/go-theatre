@@ -27,7 +27,7 @@ func TestFrameRoundTrip_ActorForward(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	original := ActorForward{
+	original := actorForward{
 		ActorType:    "greeter",
 		ActorID:      "abc-123",
 		Body:         "hello world",
@@ -38,7 +38,7 @@ func TestFrameRoundTrip_ActorForward(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		p := &transportPeer{hostID: "test", conn: c1}
-		tr := &Transport{} // only needed to call writeFrame
+		tr := &Transport{config: defaultTransportConfig()} // only needed to call writeFrame
 		errCh <- tr.writeFrame(p, testEnvelope(original))
 	}()
 
@@ -50,12 +50,12 @@ func TestFrameRoundTrip_ActorForward(t *testing.T) {
 		t.Fatalf("writeFrame: %v", err)
 	}
 
-	if env.Tag != TagActorForward {
-		t.Fatalf("tag: got %d, want %d", env.Tag, TagActorForward)
+	if env.Tag != tagActorForward {
+		t.Fatalf("tag: got %d, want %d", env.Tag, tagActorForward)
 	}
-	got, ok := env.Payload.(*ActorForward)
+	got, ok := env.Payload.(*actorForward)
 	if !ok {
-		t.Fatalf("payload type: got %T, want *ActorForward", env.Payload)
+		t.Fatalf("payload type: got %T, want *actorForward", env.Payload)
 	}
 	if got.ActorType != original.ActorType {
 		t.Errorf("ActorType: got %q, want %q", got.ActorType, original.ActorType)
@@ -79,7 +79,7 @@ func TestFrameRoundTrip_ActorForwardReply(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	original := ActorForwardReply{
+	original := actorForwardReply{
 		ReplyID: 99,
 		Body:    "response payload",
 		Error:   "something went wrong",
@@ -88,7 +88,7 @@ func TestFrameRoundTrip_ActorForwardReply(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		p := &transportPeer{hostID: "test", conn: c1}
-		tr := &Transport{}
+		tr := &Transport{config: defaultTransportConfig()}
 		errCh <- tr.writeFrame(p, testEnvelope(original))
 	}()
 
@@ -100,10 +100,10 @@ func TestFrameRoundTrip_ActorForwardReply(t *testing.T) {
 		t.Fatalf("writeFrame: %v", err)
 	}
 
-	if env.Tag != TagActorForwardReply {
-		t.Fatalf("tag: got %d, want %d", env.Tag, TagActorForwardReply)
+	if env.Tag != tagActorForwardReply {
+		t.Fatalf("tag: got %d, want %d", env.Tag, tagActorForwardReply)
 	}
-	got := env.Payload.(*ActorForwardReply)
+	got := env.Payload.(*actorForwardReply)
 	if got.ReplyID != original.ReplyID {
 		t.Errorf("ReplyID: got %d, want %d", got.ReplyID, original.ReplyID)
 	}
@@ -120,7 +120,7 @@ func TestFrameRoundTrip_NotHere(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	original := NotHere{
+	original := notHere{
 		ActorType: "worker",
 		ActorID:   "7",
 		HostID:    "host-b",
@@ -130,7 +130,7 @@ func TestFrameRoundTrip_NotHere(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		p := &transportPeer{hostID: "test", conn: c1}
-		tr := &Transport{}
+		tr := &Transport{config: defaultTransportConfig()}
 		errCh <- tr.writeFrame(p, testEnvelope(original))
 	}()
 
@@ -142,7 +142,7 @@ func TestFrameRoundTrip_NotHere(t *testing.T) {
 		t.Fatalf("writeFrame: %v", err)
 	}
 
-	got := env.Payload.(*NotHere)
+	got := env.Payload.(*notHere)
 	if got.ActorType != original.ActorType || got.ActorID != original.ActorID ||
 		got.HostID != original.HostID || got.Epoch != original.Epoch {
 		t.Errorf("got %+v, want %+v", got, original)
@@ -154,12 +154,12 @@ func TestFrameRoundTrip_HostFrozen(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 
-	original := HostFrozen{ReplyID: 10, HostID: "host-c", Epoch: 3}
+	original := hostFrozen{ReplyID: 10, HostID: "host-c", Epoch: 3}
 
 	errCh := make(chan error, 1)
 	go func() {
 		p := &transportPeer{hostID: "test", conn: c1}
-		tr := &Transport{}
+		tr := &Transport{config: defaultTransportConfig()}
 		errCh <- tr.writeFrame(p, testEnvelope(original))
 	}()
 
@@ -171,7 +171,7 @@ func TestFrameRoundTrip_HostFrozen(t *testing.T) {
 		t.Fatalf("writeFrame: %v", err)
 	}
 
-	got := env.Payload.(*HostFrozen)
+	got := env.Payload.(*hostFrozen)
 	if got.ReplyID != original.ReplyID || got.HostID != original.HostID || got.Epoch != original.Epoch {
 		t.Errorf("got %+v, want %+v", got, original)
 	}
@@ -185,8 +185,8 @@ func TestFrameRoundTrip_PingPong(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		p := &transportPeer{hostID: "test", conn: c1}
-		tr := &Transport{}
-		errCh <- tr.writeFrame(p, testEnvelope(TransportPing{}))
+		tr := &Transport{config: defaultTransportConfig()}
+		errCh <- tr.writeFrame(p, testEnvelope(transportPing{}))
 	}()
 
 	env, err := readFrame(c2)
@@ -196,11 +196,11 @@ func TestFrameRoundTrip_PingPong(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("writeFrame: %v", err)
 	}
-	if env.Tag != TagPing {
-		t.Fatalf("tag: got %d, want %d", env.Tag, TagPing)
+	if env.Tag != tagPing {
+		t.Fatalf("tag: got %d, want %d", env.Tag, tagPing)
 	}
-	if _, ok := env.Payload.(*TransportPing); !ok {
-		t.Fatalf("payload: got %T, want *TransportPing", env.Payload)
+	if _, ok := env.Payload.(*transportPing); !ok {
+		t.Fatalf("payload: got %T, want *transportPing", env.Payload)
 	}
 
 	// Now pong.
@@ -210,8 +210,8 @@ func TestFrameRoundTrip_PingPong(t *testing.T) {
 
 	go func() {
 		p := &transportPeer{hostID: "test", conn: c3}
-		tr := &Transport{}
-		errCh <- tr.writeFrame(p, testEnvelope(TransportPong{}))
+		tr := &Transport{config: defaultTransportConfig()}
+		errCh <- tr.writeFrame(p, testEnvelope(transportPong{}))
 	}()
 
 	env, err = readFrame(c4)
@@ -221,8 +221,8 @@ func TestFrameRoundTrip_PingPong(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("writeFrame pong: %v", err)
 	}
-	if env.Tag != TagPong {
-		t.Fatalf("tag: got %d, want %d", env.Tag, TagPong)
+	if env.Tag != tagPong {
+		t.Fatalf("tag: got %d, want %d", env.Tag, tagPong)
 	}
 }
 
@@ -299,7 +299,7 @@ func TestTransport_PeerAddressFromHandshake(t *testing.T) {
 	received := make(chan struct{}, 1)
 
 	handlerB := func(from string, env TransportEnvelope) {
-		if env.Tag == TagActorForward {
+		if env.Tag == tagActorForward {
 			received <- struct{}{}
 		}
 	}
@@ -320,7 +320,7 @@ func TestTransport_PeerAddressFromHandshake(t *testing.T) {
 
 	// A sends a message to B, which establishes an outbound connection from A→B
 	// and an inbound connection on B from A.
-	fwdEnv, err := Envelope(&ActorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
+	fwdEnv, err := Envelope(&actorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
 	if err != nil {
 		t.Fatalf("Envelope: %v", err)
 	}
@@ -361,12 +361,12 @@ func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
 	receivedB := make(chan struct{}, 10)
 
 	handlerA := func(from string, env TransportEnvelope) {
-		if env.Tag == TagActorForward {
+		if env.Tag == tagActorForward {
 			receivedA <- struct{}{}
 		}
 	}
 	handlerB := func(from string, env TransportEnvelope) {
-		if env.Tag == TagActorForward {
+		if env.Tag == tagActorForward {
 			receivedB <- struct{}{}
 		}
 	}
@@ -387,7 +387,7 @@ func TestTransport_SimultaneousConnect_TieBreaking(t *testing.T) {
 	defer tB.Stop()
 
 	mkFwd := func(sender string) TransportEnvelope {
-		env, _ := Envelope(&ActorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: sender})
+		env, _ := Envelope(&actorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: sender})
 		return env
 	}
 
@@ -457,12 +457,12 @@ func TestEnvelope_KnownTypes(t *testing.T) {
 		payload interface{}
 		wantTag byte
 	}{
-		{"ActorForward", ActorForward{}, TagActorForward},
-		{"ActorForwardReply", ActorForwardReply{}, TagActorForwardReply},
-		{"NotHere", NotHere{}, TagNotHere},
-		{"HostFrozen", HostFrozen{}, TagHostFrozen},
-		{"Ping", TransportPing{}, TagPing},
-		{"Pong", TransportPong{}, TagPong},
+		{"actorForward", actorForward{}, tagActorForward},
+		{"actorForwardReply", actorForwardReply{}, tagActorForwardReply},
+		{"notHere", notHere{}, tagNotHere},
+		{"hostFrozen", hostFrozen{}, tagHostFrozen},
+		{"Ping", transportPing{}, tagPing},
+		{"Pong", transportPong{}, tagPong},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -480,22 +480,22 @@ func TestEnvelope_KnownTypes(t *testing.T) {
 // --- full transport integration tests ---
 
 func TestTransport_ForwardAndReply(t *testing.T) {
-	replyCh := make(chan *ActorForwardReply, 1)
-	forwardCh := make(chan *ActorForward, 1)
+	replyCh := make(chan *actorForwardReply, 1)
+	forwardCh := make(chan *actorForward, 1)
 
 	var tB *Transport
 
 	handlerA := func(from string, env TransportEnvelope) {
-		if msg, ok := env.Payload.(*ActorForwardReply); ok {
+		if msg, ok := env.Payload.(*actorForwardReply); ok {
 			cp := *msg // copy before return — readLoop recycles pooled structs
 			replyCh <- &cp
 		}
 	}
 
 	handlerB := func(from string, env TransportEnvelope) {
-		if msg, ok := env.Payload.(*ActorForward); ok {
+		if msg, ok := env.Payload.(*actorForward); ok {
 			// Build reply BEFORE copying (uses msg fields directly).
-			replyEnv, err := Envelope(ActorForwardReply{
+			replyEnv, err := Envelope(actorForwardReply{
 				ReplyID: msg.ReplyID,
 				Body:    "pong:" + msg.Body.(string),
 			})
@@ -524,7 +524,7 @@ func TestTransport_ForwardAndReply(t *testing.T) {
 	defer tB.Stop()
 
 	// A sends forward to B.
-	fwdEnv, err := Envelope(ActorForward{
+	fwdEnv, err := Envelope(actorForward{
 		ActorType:    "greeter",
 		ActorID:      "1",
 		Body:         "hello",
@@ -587,7 +587,7 @@ func TestTransport_PingPong(t *testing.T) {
 	defer tB.Stop()
 
 	// Establish connection by sending a regular message.
-	fwdEnv, _ := Envelope(&ActorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
+	fwdEnv, _ := Envelope(&actorForward{ActorType: "t", ActorID: "1", Body: "hi", SenderHostID: "host-a"})
 	if err := tA.SendTo("host-b", tB.Addr(), fwdEnv); err != nil {
 		t.Fatalf("SendTo: %v", err)
 	}
@@ -596,7 +596,7 @@ func TestTransport_PingPong(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Send a manual Ping and wait for latencyUs to populate.
-	pingEnv, err := Envelope(&TransportPing{SentAt: time.Now().UnixMicro()})
+	pingEnv, err := Envelope(&transportPing{SentAt: time.Now().UnixMicro()})
 	if err != nil {
 		t.Fatalf("Envelope ping: %v", err)
 	}
@@ -627,7 +627,7 @@ func TestTransport_MultipleMessages(t *testing.T) {
 	received := make(chan int64, count)
 
 	handlerB := func(from string, env TransportEnvelope) {
-		if msg, ok := env.Payload.(*ActorForward); ok {
+		if msg, ok := env.Payload.(*actorForward); ok {
 			received <- msg.ReplyID
 		}
 	}
@@ -647,7 +647,7 @@ func TestTransport_MultipleMessages(t *testing.T) {
 	defer tB.Stop()
 
 	for i := int64(0); i < count; i++ {
-		env, err := Envelope(ActorForward{
+		env, err := Envelope(actorForward{
 			ActorType:    "counter",
 			ActorID:      "1",
 			Body:         "tick",
@@ -686,7 +686,7 @@ func TestTransport_CustomBodyType(t *testing.T) {
 	received := make(chan GreetRequest, 1)
 
 	handlerB := func(from string, env TransportEnvelope) {
-		if msg, ok := env.Payload.(*ActorForward); ok {
+		if msg, ok := env.Payload.(*actorForward); ok {
 			if gr, ok := msg.Body.(GreetRequest); ok {
 				received <- gr
 			}
@@ -707,7 +707,7 @@ func TestTransport_CustomBodyType(t *testing.T) {
 	tB.Start()
 	defer tB.Stop()
 
-	env, err := Envelope(ActorForward{
+	env, err := Envelope(actorForward{
 		ActorType:    "greeter",
 		ActorID:      "1",
 		Body:         GreetRequest{Name: "Alice"},
@@ -736,19 +736,19 @@ func TestTransport_CustomBodyType(t *testing.T) {
 // benchmarkMessages returns the set of envelopes used across benchmarks.
 func benchmarkMessages() map[string]TransportEnvelope {
 	return map[string]TransportEnvelope{
-		"ActorForward": testEnvelope(ActorForward{
+		"actorForward": testEnvelope(actorForward{
 			ActorType:    "greeter",
 			ActorID:      "abc-123",
 			Body:         "hello world",
 			ReplyID:      42,
 			SenderHostID: "host-a",
 		}),
-		"ActorForwardReply": testEnvelope(ActorForwardReply{
+		"actorForwardReply": testEnvelope(actorForwardReply{
 			ReplyID: 99,
 			Body:    "response payload",
 			Error:   "something went wrong",
 		}),
-		"Ping": testEnvelope(TransportPing{}),
+		"Ping": testEnvelope(transportPing{}),
 	}
 }
 
@@ -787,7 +787,7 @@ func BenchmarkWriteFrame(b *testing.B) {
 			}()
 
 			p := &transportPeer{hostID: "bench", conn: c1}
-			tr := &Transport{}
+			tr := &Transport{config: defaultTransportConfig()}
 
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -841,7 +841,7 @@ func BenchmarkRoundTrip(b *testing.B) {
 			defer c2.Close()
 
 			p := &transportPeer{hostID: "bench", conn: c1}
-			tr := &Transport{}
+			tr := &Transport{config: defaultTransportConfig()}
 
 			errCh := make(chan error, 1)
 
@@ -851,7 +851,7 @@ func BenchmarkRoundTrip(b *testing.B) {
 				go func() {
 					errCh <- tr.writeFrame(p, env)
 				}()
-				if _, err := decodeFrame(c2); err != nil {
+				if _, err := readFrame(c2); err != nil {
 					b.Fatal(err)
 				}
 				if err := <-errCh; err != nil {
@@ -896,18 +896,18 @@ func BenchmarkGobDecode(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				dec := gob.NewDecoder(bytes.NewReader(encoded))
 				switch env.Tag {
-				case TagActorForward:
-					var v ActorForward
+				case tagActorForward:
+					var v actorForward
 					if err := dec.Decode(&v); err != nil {
 						b.Fatal(err)
 					}
-				case TagActorForwardReply:
-					var v ActorForwardReply
+				case tagActorForwardReply:
+					var v actorForwardReply
 					if err := dec.Decode(&v); err != nil {
 						b.Fatal(err)
 					}
-				case TagPing:
-					var v TransportPing
+				case tagPing:
+					var v transportPing
 					if err := dec.Decode(&v); err != nil {
 						b.Fatal(err)
 					}
@@ -930,7 +930,7 @@ func BenchmarkDecodeFrame(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				r := bytes.NewReader(single)
-				if _, err := decodeFrame(r); err != nil {
+				if _, err := readFrame(r); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -988,14 +988,14 @@ func BenchmarkGobDecodeReuse(b *testing.B) {
 			dec := gob.NewDecoder(&decBuf)
 			decBuf.Write(warmupGob)
 			switch env.Tag {
-			case TagActorForward:
-				var v ActorForward
+			case tagActorForward:
+				var v actorForward
 				dec.Decode(&v)
-			case TagActorForwardReply:
-				var v ActorForwardReply
+			case tagActorForwardReply:
+				var v actorForwardReply
 				dec.Decode(&v)
-			case TagPing:
-				var v TransportPing
+			case tagPing:
+				var v transportPing
 				dec.Decode(&v)
 			}
 
@@ -1005,18 +1005,18 @@ func BenchmarkGobDecodeReuse(b *testing.B) {
 				decBuf.Reset()
 				decBuf.Write(steadyGob)
 				switch env.Tag {
-				case TagActorForward:
-					var v ActorForward
+				case tagActorForward:
+					var v actorForward
 					if err := dec.Decode(&v); err != nil {
 						b.Fatal(err)
 					}
-				case TagActorForwardReply:
-					var v ActorForwardReply
+				case tagActorForwardReply:
+					var v actorForwardReply
 					if err := dec.Decode(&v); err != nil {
 						b.Fatal(err)
 					}
-				case TagPing:
-					var v TransportPing
+				case tagPing:
+					var v transportPing
 					if err := dec.Decode(&v); err != nil {
 						b.Fatal(err)
 					}

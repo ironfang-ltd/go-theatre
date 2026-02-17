@@ -430,7 +430,7 @@ func TestFreeze_StopAfterFreeze(t *testing.T) {
 }
 
 func TestFreeze_RequestManagerFailAll(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	r1 := rm.Create(ref)
@@ -467,7 +467,7 @@ func TestFreeze_RequestManagerFailAll(t *testing.T) {
 }
 
 func TestFreeze_RegistryForceDeregisterAll(t *testing.T) {
-	am := NewActorManager()
+	am := newActorManager()
 
 	// Create a few actors manually (no goroutines needed for this test).
 	a1 := &Actor{ref: NewRef("test", "1"), inbox: make(chan InboxMessage, 1), shutdown: make(chan bool, 1)}

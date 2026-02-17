@@ -53,16 +53,16 @@ type SQLDB interface {
 	Conn(ctx context.Context) (*sql.Conn, error)
 }
 
-// Cluster manages this host's membership in a Postgres-backed cluster.
-// It acquires an advisory lock on the host ID, registers with an epoch bump,
-// renews its lease periodically, polls for live hosts, and maintains a
-// consistent hash ring.
 // hostsSnapshot is an immutable snapshot of live hosts, swapped atomically.
 type hostsSnapshot struct {
 	list []HostInfo
 	byID map[string]HostInfo // O(1) lookup by host ID
 }
 
+// Cluster manages this host's membership in a Postgres-backed cluster.
+// It acquires an advisory lock on the host ID, registers with an epoch bump,
+// renews its lease periodically, polls for live hosts, and maintains a
+// consistent hash ring.
 type Cluster struct {
 	db     SQLDB
 	config ClusterConfig

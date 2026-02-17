@@ -13,7 +13,7 @@ import (
 var ErrNoOwner = fmt.Errorf("no owner found for actor")
 
 // pendingRemoteRequest tracks a forwarded request so it can be retried
-// if the target responds with NotHere.
+// if the target responds with notHere.
 type pendingRemoteRequest struct {
 	msg     OutboxMessage
 	ref     Ref
@@ -65,7 +65,7 @@ func (pm *pendingRemoteMap) LoadAndDelete(id int64) (*pendingRemoteRequest, bool
 }
 
 // Range iterates all entries across all shards. Used on cold paths only
-// (NotHere / HostFrozen retry).
+// (notHere / hostFrozen retry).
 func (pm *pendingRemoteMap) Range(fn func(id int64, pr *pendingRemoteRequest) bool) {
 	for i := range pm.shards {
 		s := &pm.shards[i]
@@ -83,6 +83,12 @@ func (pm *pendingRemoteMap) Range(fn func(id int64, pr *pendingRemoteRequest) bo
 // SetTransport wires the transport into this host. Must be called before Start.
 func (m *Host) SetTransport(t *Transport) {
 	m.transport = t
+	t.SetOnError(func(message, remoteID, detail string) {
+		if remoteID != "" {
+			message = message + " (peer " + remoteID + ")"
+		}
+		m.recordError("transport", message, detail)
+	})
 }
 
 // SetCluster wires the cluster into this host and creates a placement cache.
@@ -98,16 +104,17 @@ func (m *Host) SetCluster(c *Cluster) {
 // Pass it to NewTransport as the handler callback.
 func (m *Host) HandleTransportMessage(fromHostID string, env TransportEnvelope) {
 	switch msg := env.Payload.(type) {
-	case *ActorForward:
+	case *actorForward:
 		m.handleActorForward(fromHostID, msg)
-	case *ActorForwardReply:
+	case *actorForwardReply:
 		m.handleActorForwardReply(msg)
-	case *NotHere:
+	case *notHere:
 		m.handleNotHere(msg)
-	case *HostFrozen:
+	case *hostFrozen:
 		m.handleHostFrozen(msg)
 	default:
 		slog.Warn("host received unhandled transport message", "tag", env.Tag, "from", fromHostID)
+		m.recordWarn("routing", "unhandled transport message", fmt.Sprintf("tag=%d from=%s", env.Tag, fromHostID))
 	}
 }
 
@@ -159,6 +166,7 @@ func (m *Host) routeMessage(msg OutboxMessage) {
 					if err := m.forwardToRemote(entry.HostID, entry.Address, ref, msg); err != nil {
 						slog.Warn("forward failed, evicting cache",
 							"ref", ref, "target", entry.HostID, "error", err)
+						m.recordWarn("routing", "forward failed, evicting cache", err.Error())
 						m.placementCache.Evict(ref)
 						m.resolveAndForward(ref, msg)
 					}
@@ -196,17 +204,18 @@ func (m *Host) routeReply(msg OutboxMessage) {
 	}
 
 	// Remote reply via transport.
-	reply := actorForwardReplyPool.Get().(*ActorForwardReply)
+	reply := actorForwardReplyPool.Get().(*actorForwardReply)
 	reply.ReplyID = msg.ReplyID
 	reply.Body = msg.Body
 	reply.Error = ""
 	if msg.Error != nil {
 		reply.Error = msg.Error.Error()
 	}
-	env := TransportEnvelope{Tag: TagActorForwardReply, Payload: reply}
+	env := TransportEnvelope{Tag: tagActorForwardReply, Payload: reply}
 	if err := m.transport.SendTo(msg.recipientHostID, msg.recipientAddress, env); err != nil {
 		slog.Error("transport reply failed",
 			"recipientHostID", msg.recipientHostID, "error", err)
+		m.recordError("routing", "transport reply failed", err.Error())
 		recyclePayload(env)
 	} else {
 		m.metrics.MessagesSent.Add(1)
@@ -228,13 +237,13 @@ func (m *Host) deliverLocal(msg OutboxMessage) {
 // --- remote forwarding ---
 
 func (m *Host) forwardToRemote(hostID, address string, ref Ref, msg OutboxMessage) error {
-	fwd := actorForwardPool.Get().(*ActorForward)
+	fwd := actorForwardPool.Get().(*actorForward)
 	fwd.ActorType = ref.Type
 	fwd.ActorID = ref.ID
 	fwd.Body = msg.Body
 	fwd.ReplyID = msg.ReplyID
 	fwd.SenderHostID = m.localHostID
-	env := TransportEnvelope{Tag: TagActorForward, Payload: fwd}
+	env := TransportEnvelope{Tag: tagActorForward, Payload: fwd}
 	if msg.ReplyID != 0 {
 		m.storePendingRemote(msg.ReplyID, ref, msg)
 	}
@@ -252,6 +261,7 @@ func (m *Host) resolveAndForward(ref Ref, msg OutboxMessage) {
 	owner, err := m.resolveOwner(ref)
 	if err != nil {
 		slog.Error("resolve owner failed", "ref", ref, "error", err)
+		m.recordError("routing", "resolve owner failed", err.Error())
 		m.handleDeadLetter(msg)
 		return
 	}
@@ -268,6 +278,7 @@ func (m *Host) resolveAndForward(ref Ref, msg OutboxMessage) {
 
 		if err := m.forwardToRemote(owner.HostID, owner.Address, ref, msg); err != nil {
 			slog.Error("forward to resolved owner failed", "ref", ref, "error", err)
+			m.recordError("routing", "forward to resolved owner failed", err.Error())
 			m.handleDeadLetter(msg)
 		}
 		return
@@ -299,13 +310,14 @@ func (m *Host) resolveAndForward(ref Ref, msg OutboxMessage) {
 		}
 		if err := m.forwardToRemote(preferredHost, h.Address, ref, msg); err != nil {
 			slog.Error("forward to preferred host failed", "ref", ref, "error", err)
+			m.recordError("routing", "forward to preferred host failed", err.Error())
 			m.handleDeadLetter(msg)
 			return
 		}
 		// Populate placement cache so subsequent Send()/Request() calls
 		// use the fast path (direct forwardToRemote, bypassing outbox).
 		if m.placementCache != nil {
-			m.placementCache.Put(ref, PlacementEntry{
+			m.placementCache.Put(ref, placementEntry{
 				HostID:  preferredHost,
 				Address: h.Address,
 				Epoch:   h.Epoch,
@@ -320,6 +332,7 @@ func (m *Host) activateAndDeliver(ref Ref, claim bool, msg OutboxMessage) {
 	a, err := m.activateActor(ref, claim)
 	if err != nil {
 		slog.Warn("activation failed", "ref", ref, "error", err)
+		m.recordWarn("routing", "activation failed", err.Error())
 		m.handleDeadLetter(msg)
 		return
 	}
@@ -333,7 +346,7 @@ func (m *Host) activateAndDeliver(ref Ref, claim bool, msg OutboxMessage) {
 
 // --- DB ownership resolution (read-only) ---
 
-func (m *Host) resolveOwner(ref Ref) (*PlacementEntry, error) {
+func (m *Host) resolveOwner(ref Ref) (*placementEntry, error) {
 	if m.cluster == nil || m.cluster.DB() == nil {
 		return nil, nil
 	}
@@ -357,7 +370,7 @@ func (m *Host) resolveOwner(ref Ref) (*PlacementEntry, error) {
 		return nil, err
 	}
 
-	return &PlacementEntry{
+	return &placementEntry{
 		HostID:  hostID,
 		Address: address,
 		Epoch:   ownerEpoch,
@@ -365,7 +378,7 @@ func (m *Host) resolveOwner(ref Ref) (*PlacementEntry, error) {
 }
 
 // isEntryLive validates a placement entry against the cluster's live host list.
-func (m *Host) isEntryLive(entry PlacementEntry) bool {
+func (m *Host) isEntryLive(entry placementEntry) bool {
 	if m.cluster == nil {
 		return true // no liveness info → trust the cache
 	}
@@ -390,8 +403,8 @@ func (m *Host) getHostAddress(hostID string) string {
 
 // --- inbound transport handlers ---
 
-func (m *Host) handleActorForward(fromHostID string, msg *ActorForward) {
-	// If frozen, reject with HostFrozen so the sender can re-route.
+func (m *Host) handleActorForward(fromHostID string, msg *actorForward) {
+	// If frozen, reject with hostFrozen so the sender can re-route.
 	if m.frozen.Load() {
 		m.sendHostFrozen(fromHostID, msg)
 		return
@@ -405,7 +418,7 @@ func (m *Host) handleActorForward(fromHostID string, msg *ActorForward) {
 		var err error
 		a, err = m.activateActor(ref, true)
 		if err != nil {
-			slog.Info("activation on forward failed, sending NotHere",
+			slog.Info("activation on forward failed, sending notHere",
 				"ref", ref, "from", fromHostID, "error", err)
 		}
 	}
@@ -432,12 +445,13 @@ func (m *Host) handleActorForward(fromHostID string, msg *ActorForward) {
 	m.metrics.MessagesReceived.Add(1)
 }
 
-func (m *Host) handleActorForwardReply(msg *ActorForwardReply) {
+func (m *Host) handleActorForwardReply(msg *actorForwardReply) {
 	m.removePendingRemote(msg.ReplyID)
 
 	req := m.requests.Get(msg.ReplyID)
 	if req == nil {
 		slog.Warn("received reply for unknown request", "replyID", msg.ReplyID)
+		m.recordWarn("routing", "reply for unknown request", fmt.Sprintf("replyID=%d", msg.ReplyID))
 		return
 	}
 
@@ -451,9 +465,9 @@ func (m *Host) handleActorForwardReply(msg *ActorForwardReply) {
 	req.Response <- res
 }
 
-func (m *Host) handleNotHere(msg *NotHere) {
+func (m *Host) handleNotHere(msg *notHere) {
 	ref := NewRef(msg.ActorType, msg.ActorID)
-	slog.Info("received NotHere", "actor", ref, "fromHost", msg.HostID)
+	slog.Info("received notHere", "actor", ref, "fromHost", msg.HostID)
 
 	if m.placementCache != nil {
 		m.placementCache.Evict(ref)
@@ -462,13 +476,13 @@ func (m *Host) handleNotHere(msg *NotHere) {
 	m.retryPendingForActor(ref)
 }
 
-func (m *Host) sendNotHere(toHostID string, fwd *ActorForward) {
+func (m *Host) sendNotHere(toHostID string, fwd *actorForward) {
 	if m.transport == nil || m.cluster == nil {
 		return
 	}
 	env := TransportEnvelope{
-		Tag: TagNotHere,
-		Payload: &NotHere{
+		Tag: tagNotHere,
+		Payload: &notHere{
 			ActorType: fwd.ActorType,
 			ActorID:   fwd.ActorID,
 			HostID:    m.localHostID,
@@ -477,17 +491,18 @@ func (m *Host) sendNotHere(toHostID string, fwd *ActorForward) {
 	}
 	address := m.getHostAddress(toHostID)
 	if err := m.transport.SendTo(toHostID, address, env); err != nil {
-		slog.Error("failed to send NotHere", "to", toHostID, "error", err)
+		slog.Error("failed to send notHere", "to", toHostID, "error", err)
+		m.recordError("routing", "failed to send notHere", err.Error())
 	}
 }
 
-func (m *Host) sendHostFrozen(toHostID string, fwd *ActorForward) {
+func (m *Host) sendHostFrozen(toHostID string, fwd *actorForward) {
 	if m.transport == nil || m.cluster == nil {
 		return
 	}
 	env := TransportEnvelope{
-		Tag: TagHostFrozen,
-		Payload: &HostFrozen{
+		Tag: tagHostFrozen,
+		Payload: &hostFrozen{
 			ActorType: fwd.ActorType,
 			ActorID:   fwd.ActorID,
 			ReplyID:   fwd.ReplyID,
@@ -497,15 +512,16 @@ func (m *Host) sendHostFrozen(toHostID string, fwd *ActorForward) {
 	}
 	address := m.getHostAddress(toHostID)
 	if err := m.transport.SendTo(toHostID, address, env); err != nil {
-		slog.Error("failed to send HostFrozen", "to", toHostID, "error", err)
+		slog.Error("failed to send hostFrozen", "to", toHostID, "error", err)
+		m.recordError("routing", "failed to send hostFrozen", err.Error())
 	}
 }
 
 // handleHostFrozen is called when a remote host tells us it is frozen.
-// Treat like NotHere — evict cache and retry pending requests.
-func (m *Host) handleHostFrozen(msg *HostFrozen) {
+// Treat like notHere — evict cache and retry pending requests.
+func (m *Host) handleHostFrozen(msg *hostFrozen) {
 	ref := NewRef(msg.ActorType, msg.ActorID)
-	slog.Info("received HostFrozen", "actor", ref, "fromHost", msg.HostID)
+	slog.Info("received hostFrozen", "actor", ref, "fromHost", msg.HostID)
 
 	if m.placementCache != nil {
 		m.placementCache.Evict(ref)
@@ -561,6 +577,7 @@ func (m *Host) retryPendingForActor(ref Ref) {
 	owner, err := m.resolveOwner(ref)
 	if err != nil {
 		slog.Error("re-resolve failed", "ref", ref, "error", err)
+		m.recordError("routing", "re-resolve failed", err.Error())
 	}
 
 	for _, pr := range toRetry {
@@ -600,6 +617,7 @@ func (m *Host) failPendingRequest(replyID int64, err error) {
 func (m *Host) handleDeadLetter(msg OutboxMessage) {
 	m.metrics.MessagesDeadLettered.Add(1)
 	slog.Warn("dead letter", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
+	m.recordWarn("routing", "dead letter", msg.RecipientRef.Type+"/"+msg.RecipientRef.ID)
 
 	if msg.ReplyID != 0 {
 		m.failPendingRequest(msg.ReplyID, ErrNoOwner)

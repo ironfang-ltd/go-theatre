@@ -63,6 +63,8 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 	mux.HandleFunc("/cluster/all-actors", as.handleAllActors)
 	mux.HandleFunc("/cluster/actor", as.handleClusterActor)
 	mux.HandleFunc("/cluster/local-actor", as.handleLocalActor)
+	mux.HandleFunc("/cluster/errors", as.handleClusterErrors)
+	mux.HandleFunc("/cluster/all-errors", as.handleAllErrors)
 	mux.HandleFunc("/debug/vars", expvar.Handler().ServeHTTP)
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -1057,6 +1059,103 @@ func (as *AdminServer) handleAllActors(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, allActorsResponse{Actors: entries, Total: total})
+}
+
+// --- error log ---
+
+// clusterErrorsResponse is the JSON structure for GET /cluster/errors.
+type clusterErrorsResponse struct {
+	Errors []ErrorEntry `json:"errors"`
+	Total  int          `json:"total"`
+}
+
+func (as *AdminServer) handleClusterErrors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+
+	el := as.host.errorLog
+	writeJSON(w, clusterErrorsResponse{
+		Errors: el.Recent(limit),
+		Total:  el.Total(),
+	})
+}
+
+// allErrorsResponse is the JSON structure for GET /cluster/all-errors.
+type allErrorsResponse struct {
+	Errors []allErrorEntry `json:"errors"`
+	Total  int             `json:"total"`
+}
+
+type allErrorEntry struct {
+	ErrorEntry
+	HostID string `json:"host_id"`
+}
+
+func (as *AdminServer) handleAllErrors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+
+	h := as.host
+	localID := h.localHostID
+	if localID == "" {
+		localID = h.hostRef.String()
+	}
+
+	// Local errors.
+	localEntries := h.errorLog.Recent(limit)
+	entries := make([]allErrorEntry, 0, len(localEntries))
+	for _, e := range localEntries {
+		entries = append(entries, allErrorEntry{ErrorEntry: e, HostID: localID})
+	}
+	total := h.errorLog.Total()
+
+	// Remote errors via fan-out.
+	remotes := as.fanOutGet(r.Context(), fmt.Sprintf("/cluster/errors?limit=%d", limit))
+	for hostID, body := range remotes {
+		var resp clusterErrorsResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			continue
+		}
+		total += resp.Total
+		for _, e := range resp.Errors {
+			entries = append(entries, allErrorEntry{ErrorEntry: e, HostID: hostID})
+		}
+	}
+
+	// Sort by time descending (newest first).
+	slices.SortFunc(entries, func(a, b allErrorEntry) int {
+		return b.Time.Compare(a.Time)
+	})
+
+	// Trim to limit.
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+
+	// Ensure non-nil slice for JSON.
+	if entries == nil {
+		entries = []allErrorEntry{}
+	}
+
+	writeJSON(w, allErrorsResponse{Errors: entries, Total: total})
 }
 
 // --- helpers ---

@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+// Context is passed to Receiver.Receive on each message. It provides methods
+// to send messages, make requests, and reply to the current message.
 type Context struct {
 	// The ID of the current actor
 	ActorRef Ref
@@ -28,6 +30,7 @@ type Context struct {
 	senderAddress string
 }
 
+// Send delivers a fire-and-forget message to the actor identified by ref.
 func (c *Context) Send(ref Ref, body interface{}) error {
 	c.host.sendInternal(OutboxMessage{
 		RecipientRef: ref,
@@ -36,6 +39,7 @@ func (c *Context) Send(ref Ref, body interface{}) error {
 	return nil
 }
 
+// Request sends a message to the actor identified by ref and waits for a reply.
 func (c *Context) Request(ref Ref, body interface{}) (any, error) {
 	return c.host.requestInternal(ref, body)
 }
@@ -55,6 +59,8 @@ func (c *Context) CancelSchedule(id ScheduleID) error {
 	return c.host.CancelSchedule(id)
 }
 
+// Reply sends a response back to the caller of a Request. For fire-and-forget
+// messages (no pending request), Reply is a no-op.
 func (c *Context) Reply(body interface{}) error {
 	if c.replyId == 0 {
 		return nil // fire-and-forget message, no reply expected

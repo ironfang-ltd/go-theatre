@@ -1,5 +1,6 @@
 package theatre
 
+// InboxMessage is a message delivered to an actor's inbox for processing.
 type InboxMessage struct {
 	SenderHostRef HostRef
 	RecipientRef  Ref
@@ -14,6 +15,7 @@ type InboxMessage struct {
 	senderAddress string
 }
 
+// OutboxMessage is a message produced by an actor, routed by the host to its destination.
 type OutboxMessage struct {
 	RecipientHostRef HostRef
 	RecipientRef     Ref
@@ -42,8 +44,12 @@ const (
 	ActivationFailover
 )
 
+// Initialize is the first message delivered to every new actor. Receivers
+// can type-switch on it to perform setup work like loading state.
 type Initialize struct {
 	Reason ActivationReason
 }
 
+// Shutdown is sent to an actor when it is being stopped. Receivers can
+// type-switch on it to perform cleanup before the actor exits.
 type Shutdown struct{}

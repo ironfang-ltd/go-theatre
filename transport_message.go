@@ -14,13 +14,13 @@ import (
 // Frame format: [4-byte big-endian payload length][1-byte tag][binary-encoded message]
 // Payload length covers the tag byte plus the encoded bytes.
 const (
-	TagActorForward      byte = 1
-	TagActorForwardReply byte = 2
-	TagNotHere           byte = 3
-	TagHostFrozen        byte = 4
-	TagPing              byte = 5
-	TagPong              byte = 6
-	TagBatch             byte = 0x10
+	tagActorForward      byte = 1
+	tagActorForwardReply byte = 2
+	tagNotHere           byte = 3
+	tagHostFrozen        byte = 4
+	tagPing              byte = 5
+	tagPong              byte = 6
+	tagBatch             byte = 0x10
 )
 
 // Body type tags for the custom wire encoding of interface{} fields.
@@ -37,8 +37,8 @@ const (
 	bodyGob     byte = 7
 )
 
-// ActorForward requests delivery of a message to an actor on a remote host.
-type ActorForward struct {
+// actorForward requests delivery of a message to an actor on a remote host.
+type actorForward struct {
 	ActorType    string
 	ActorID      string
 	Body         interface{}
@@ -46,24 +46,24 @@ type ActorForward struct {
 	SenderHostID string
 }
 
-// ActorForwardReply carries the response to a forwarded request.
-type ActorForwardReply struct {
+// actorForwardReply carries the response to a forwarded request.
+type actorForwardReply struct {
 	ReplyID int64
 	Body    interface{}
 	Error   string
 }
 
-// NotHere tells the sender that the specified actor is not activated on this host.
-type NotHere struct {
+// notHere tells the sender that the specified actor is not activated on this host.
+type notHere struct {
 	ActorType string
 	ActorID   string
 	HostID    string
 	Epoch     int64
 }
 
-// HostFrozen tells the sender that this host has lost its lease and is frozen.
+// hostFrozen tells the sender that this host has lost its lease and is frozen.
 // The ActorType/ActorID fields identify which actor forward triggered the response.
-type HostFrozen struct {
+type hostFrozen struct {
 	ActorType string
 	ActorID   string
 	ReplyID   int64
@@ -71,22 +71,22 @@ type HostFrozen struct {
 	Epoch     int64
 }
 
-// TransportPing is a liveness probe. SentAt carries the sender's
+// transportPing is a liveness probe. SentAt carries the sender's
 // monotonic timestamp (UnixMicro) so the receiver can echo it back.
-type TransportPing struct {
+type transportPing struct {
 	SentAt int64
 }
 
-// TransportPong is the reply to a TransportPing. EchoedAt is copied
+// transportPong is the reply to a transportPing. EchoedAt is copied
 // from the original Ping's SentAt so the sender can compute RTT.
-type TransportPong struct {
+type transportPong struct {
 	EchoedAt int64
 }
 
 // TransportEnvelope is a tagged transport-layer message.
 type TransportEnvelope struct {
 	Tag     byte
-	Payload interface{} // one of *ActorForward, *ActorForwardReply, *NotHere, *HostFrozen, *TransportPing, *TransportPong
+	Payload interface{} // one of *actorForward, *actorForwardReply, *notHere, *hostFrozen, *transportPing, *transportPong
 }
 
 // Pools for the two highest-volume transport message types.
@@ -94,25 +94,25 @@ type TransportEnvelope struct {
 // and decode (decodePayload) paths. Pooling them eliminates ~6 GB of
 // allocations per 15 s at 3.5 M msg/s.
 var actorForwardPool = sync.Pool{
-	New: func() any { return &ActorForward{} },
+	New: func() any { return &actorForward{} },
 }
 
 var actorForwardReplyPool = sync.Pool{
-	New: func() any { return &ActorForwardReply{} },
+	New: func() any { return &actorForwardReply{} },
 }
 
 // recyclePayload zeros a pooled struct and returns it to its pool.
 // Safe to call on any TransportEnvelope — non-pooled types are ignored.
 func recyclePayload(env TransportEnvelope) {
 	switch env.Tag {
-	case TagActorForward:
-		if msg, ok := env.Payload.(*ActorForward); ok {
-			*msg = ActorForward{}
+	case tagActorForward:
+		if msg, ok := env.Payload.(*actorForward); ok {
+			*msg = actorForward{}
 			actorForwardPool.Put(msg)
 		}
-	case TagActorForwardReply:
-		if msg, ok := env.Payload.(*ActorForwardReply); ok {
-			*msg = ActorForwardReply{}
+	case tagActorForwardReply:
+		if msg, ok := env.Payload.(*actorForwardReply); ok {
+			*msg = actorForwardReply{}
 			actorForwardReplyPool.Put(msg)
 		}
 	}
@@ -134,18 +134,18 @@ func recycleEnvelopes(envs []TransportEnvelope) {
 func Envelope(payload interface{}) (TransportEnvelope, error) {
 	var tag byte
 	switch payload.(type) {
-	case ActorForward, *ActorForward:
-		tag = TagActorForward
-	case ActorForwardReply, *ActorForwardReply:
-		tag = TagActorForwardReply
-	case NotHere, *NotHere:
-		tag = TagNotHere
-	case HostFrozen, *HostFrozen:
-		tag = TagHostFrozen
-	case TransportPing, *TransportPing:
-		tag = TagPing
-	case TransportPong, *TransportPong:
-		tag = TagPong
+	case actorForward, *actorForward:
+		tag = tagActorForward
+	case actorForwardReply, *actorForwardReply:
+		tag = tagActorForwardReply
+	case notHere, *notHere:
+		tag = tagNotHere
+	case hostFrozen, *hostFrozen:
+		tag = tagHostFrozen
+	case transportPing, *transportPing:
+		tag = tagPing
+	case transportPong, *transportPong:
+		tag = tagPong
 	default:
 		return TransportEnvelope{}, fmt.Errorf("theatre: unknown transport message type %T", payload)
 	}
@@ -173,15 +173,15 @@ func RegisterGobType(value interface{}) {
 
 // --- binary codec: encode ---
 
-// Fast-path helpers for ActorForward and ActorForwardReply with string body.
+// Fast-path helpers for actorForward and actorForwardReply with string body.
 // These encode directly into a pre-sized byte slice using a single buf.Write
 // call, eliminating 10+ individual putStr/putI64/putBody calls per message.
 
-func actorForwardStrSize(msg *ActorForward, bodyStr string) int {
+func actorForwardStrSize(msg *actorForward, bodyStr string) int {
 	return 2 + len(msg.ActorType) + 2 + len(msg.ActorID) + 8 + 2 + len(msg.SenderHostID) + 1 + 4 + len(bodyStr)
 }
 
-func encodeActorForwardStr(b []byte, off int, msg *ActorForward, bodyStr string) int {
+func encodeActorForwardStr(b []byte, off int, msg *actorForward, bodyStr string) int {
 	binary.BigEndian.PutUint16(b[off:], uint16(len(msg.ActorType)))
 	off += 2
 	off += copy(b[off:], msg.ActorType)
@@ -201,11 +201,11 @@ func encodeActorForwardStr(b []byte, off int, msg *ActorForward, bodyStr string)
 	return off
 }
 
-func actorForwardReplyStrSize(msg *ActorForwardReply, bodyStr string) int {
+func actorForwardReplyStrSize(msg *actorForwardReply, bodyStr string) int {
 	return 8 + 2 + len(msg.Error) + 1 + 4 + len(bodyStr)
 }
 
-func encodeActorForwardReplyStr(b []byte, off int, msg *ActorForwardReply, bodyStr string) int {
+func encodeActorForwardReplyStr(b []byte, off int, msg *actorForwardReply, bodyStr string) int {
 	binary.BigEndian.PutUint64(b[off:], uint64(msg.ReplyID))
 	off += 8
 	binary.BigEndian.PutUint16(b[off:], uint16(len(msg.Error)))
@@ -222,15 +222,15 @@ func encodeActorForwardReplyStr(b []byte, off int, msg *ActorForwardReply, bodyS
 // encodePayload writes the binary-encoded payload fields into buf.
 func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 	switch env.Tag {
-	case TagActorForward:
-		var msg *ActorForward
+	case tagActorForward:
+		var msg *actorForward
 		switch v := env.Payload.(type) {
-		case *ActorForward:
+		case *actorForward:
 			msg = v
-		case ActorForward:
+		case actorForward:
 			msg = &v
 		default:
-			return fmt.Errorf("expected ActorForward, got %T", env.Payload)
+			return fmt.Errorf("expected actorForward, got %T", env.Payload)
 		}
 		// Fast path: string body (most common in production).
 		if bodyStr, ok := msg.Body.(string); ok {
@@ -247,15 +247,15 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 		putStr(buf, msg.SenderHostID)
 		return putBody(buf, msg.Body)
 
-	case TagActorForwardReply:
-		var msg *ActorForwardReply
+	case tagActorForwardReply:
+		var msg *actorForwardReply
 		switch v := env.Payload.(type) {
-		case *ActorForwardReply:
+		case *actorForwardReply:
 			msg = v
-		case ActorForwardReply:
+		case actorForwardReply:
 			msg = &v
 		default:
-			return fmt.Errorf("expected ActorForwardReply, got %T", env.Payload)
+			return fmt.Errorf("expected actorForwardReply, got %T", env.Payload)
 		}
 		// Fast path: string body.
 		if bodyStr, ok := msg.Body.(string); ok {
@@ -270,15 +270,15 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 		putStr(buf, msg.Error)
 		return putBody(buf, msg.Body)
 
-	case TagNotHere:
-		var msg *NotHere
+	case tagNotHere:
+		var msg *notHere
 		switch v := env.Payload.(type) {
-		case *NotHere:
+		case *notHere:
 			msg = v
-		case NotHere:
+		case notHere:
 			msg = &v
 		default:
-			return fmt.Errorf("expected NotHere, got %T", env.Payload)
+			return fmt.Errorf("expected notHere, got %T", env.Payload)
 		}
 		putStr(buf, msg.ActorType)
 		putStr(buf, msg.ActorID)
@@ -286,15 +286,15 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 		putI64(buf, msg.Epoch)
 		return nil
 
-	case TagHostFrozen:
-		var msg *HostFrozen
+	case tagHostFrozen:
+		var msg *hostFrozen
 		switch v := env.Payload.(type) {
-		case *HostFrozen:
+		case *hostFrozen:
 			msg = v
-		case HostFrozen:
+		case hostFrozen:
 			msg = &v
 		default:
-			return fmt.Errorf("expected HostFrozen, got %T", env.Payload)
+			return fmt.Errorf("expected hostFrozen, got %T", env.Payload)
 		}
 		putStr(buf, msg.ActorType)
 		putStr(buf, msg.ActorID)
@@ -303,28 +303,28 @@ func encodePayload(buf *bytes.Buffer, env TransportEnvelope) error {
 		putI64(buf, msg.Epoch)
 		return nil
 
-	case TagPing:
-		var msg *TransportPing
+	case tagPing:
+		var msg *transportPing
 		switch v := env.Payload.(type) {
-		case *TransportPing:
+		case *transportPing:
 			msg = v
-		case TransportPing:
+		case transportPing:
 			msg = &v
 		default:
-			return fmt.Errorf("expected TransportPing, got %T", env.Payload)
+			return fmt.Errorf("expected transportPing, got %T", env.Payload)
 		}
 		putI64(buf, msg.SentAt)
 		return nil
 
-	case TagPong:
-		var msg *TransportPong
+	case tagPong:
+		var msg *transportPong
 		switch v := env.Payload.(type) {
-		case *TransportPong:
+		case *transportPong:
 			msg = v
-		case TransportPong:
+		case transportPong:
 			msg = &v
 		default:
-			return fmt.Errorf("expected TransportPong, got %T", env.Payload)
+			return fmt.Errorf("expected transportPong, got %T", env.Payload)
 		}
 		putI64(buf, msg.EchoedAt)
 		return nil
@@ -401,20 +401,20 @@ func putBody(buf *bytes.Buffer, body interface{}) error {
 // appendEncodedPayload and appendBatchEncodedPayload encode directly into
 // a caller-provided []byte, eliminating the intermediate bytes.Buffer and
 // the copy into frameBuf that the original encodePayload path requires.
-// For the two highest-volume types (ActorForward/Reply with string body),
+// For the two highest-volume types (actorForward/Reply with string body),
 // this is a single append + in-place encode. Rare types fall back to a
 // stack-local bytes.Buffer.
 
 // appendEncodedPayload appends the binary-encoded payload of env to dst.
 func appendEncodedPayload(dst []byte, env TransportEnvelope) ([]byte, error) {
 	switch env.Tag {
-	case TagActorForward:
-		msg, ok := env.Payload.(*ActorForward)
+	case tagActorForward:
+		msg, ok := env.Payload.(*actorForward)
 		if !ok {
-			if v, ok2 := env.Payload.(ActorForward); ok2 {
+			if v, ok2 := env.Payload.(actorForward); ok2 {
 				msg = &v
 			} else {
-				return dst, fmt.Errorf("expected ActorForward, got %T", env.Payload)
+				return dst, fmt.Errorf("expected actorForward, got %T", env.Payload)
 			}
 		}
 		if bodyStr, ok := msg.Body.(string); ok {
@@ -424,13 +424,13 @@ func appendEncodedPayload(dst []byte, env TransportEnvelope) ([]byte, error) {
 			encodeActorForwardStr(dst, off, msg, bodyStr)
 			return dst, nil
 		}
-	case TagActorForwardReply:
-		msg, ok := env.Payload.(*ActorForwardReply)
+	case tagActorForwardReply:
+		msg, ok := env.Payload.(*actorForwardReply)
 		if !ok {
-			if v, ok2 := env.Payload.(ActorForwardReply); ok2 {
+			if v, ok2 := env.Payload.(actorForwardReply); ok2 {
 				msg = &v
 			} else {
-				return dst, fmt.Errorf("expected ActorForwardReply, got %T", env.Payload)
+				return dst, fmt.Errorf("expected actorForwardReply, got %T", env.Payload)
 			}
 		}
 		if bodyStr, ok := msg.Body.(string); ok {
@@ -440,24 +440,24 @@ func appendEncodedPayload(dst []byte, env TransportEnvelope) ([]byte, error) {
 			encodeActorForwardReplyStr(dst, off, msg, bodyStr)
 			return dst, nil
 		}
-	case TagPing:
-		msg, ok := env.Payload.(*TransportPing)
+	case tagPing:
+		msg, ok := env.Payload.(*transportPing)
 		if !ok {
-			if v, ok2 := env.Payload.(TransportPing); ok2 {
+			if v, ok2 := env.Payload.(transportPing); ok2 {
 				msg = &v
 			} else {
-				return dst, fmt.Errorf("expected TransportPing, got %T", env.Payload)
+				return dst, fmt.Errorf("expected transportPing, got %T", env.Payload)
 			}
 		}
 		dst = binary.BigEndian.AppendUint64(dst, uint64(msg.SentAt))
 		return dst, nil
-	case TagPong:
-		msg, ok := env.Payload.(*TransportPong)
+	case tagPong:
+		msg, ok := env.Payload.(*transportPong)
 		if !ok {
-			if v, ok2 := env.Payload.(TransportPong); ok2 {
+			if v, ok2 := env.Payload.(transportPong); ok2 {
 				msg = &v
 			} else {
-				return dst, fmt.Errorf("expected TransportPong, got %T", env.Payload)
+				return dst, fmt.Errorf("expected transportPong, got %T", env.Payload)
 			}
 		}
 		dst = binary.BigEndian.AppendUint64(dst, uint64(msg.EchoedAt))
@@ -476,12 +476,12 @@ func appendEncodedPayload(dst []byte, env TransportEnvelope) ([]byte, error) {
 func appendBatchEncodedPayload(dst []byte, envs []TransportEnvelope) ([]byte, error) {
 	dst = binary.BigEndian.AppendUint16(dst, uint16(len(envs)))
 	for _, env := range envs {
-		// Fast path: ActorForward with string body.
-		if env.Tag == TagActorForward {
-			if msg, ok := env.Payload.(*ActorForward); ok {
+		// Fast path: actorForward with string body.
+		if env.Tag == tagActorForward {
+			if msg, ok := env.Payload.(*actorForward); ok {
 				if bodyStr, ok := msg.Body.(string); ok {
 					subLen := actorForwardStrSize(msg, bodyStr)
-					dst = append(dst, TagActorForward)
+					dst = append(dst, tagActorForward)
 					dst = binary.BigEndian.AppendUint32(dst, uint32(subLen))
 					off := len(dst)
 					dst = append(dst, make([]byte, subLen)...)
@@ -490,12 +490,12 @@ func appendBatchEncodedPayload(dst []byte, envs []TransportEnvelope) ([]byte, er
 				}
 			}
 		}
-		// Fast path: ActorForwardReply with string body.
-		if env.Tag == TagActorForwardReply {
-			if msg, ok := env.Payload.(*ActorForwardReply); ok {
+		// Fast path: actorForwardReply with string body.
+		if env.Tag == tagActorForwardReply {
+			if msg, ok := env.Payload.(*actorForwardReply); ok {
 				if bodyStr, ok := msg.Body.(string); ok {
 					subLen := actorForwardReplyStrSize(msg, bodyStr)
-					dst = append(dst, TagActorForwardReply)
+					dst = append(dst, tagActorForwardReply)
 					dst = binary.BigEndian.AppendUint32(dst, uint32(subLen))
 					off := len(dst)
 					dst = append(dst, make([]byte, subLen)...)
@@ -525,7 +525,7 @@ func appendBatchEncodedPayload(dst []byte, envs []TransportEnvelope) ([]byte, er
 //	[2-byte count]
 //	  [1-byte sub-tag][4-byte sub-payload-len][sub-payload-bytes]  × count
 //
-// For the two highest-volume message types (ActorForward and ActorForwardReply
+// For the two highest-volume message types (actorForward and actorForwardReply
 // with string body), a fast path writes tag + length + payload in a single
 // buf.Write call, eliminating per-field writes and backpatching.
 func encodeBatchPayload(buf *bytes.Buffer, envs []TransportEnvelope) error {
@@ -533,15 +533,15 @@ func encodeBatchPayload(buf *bytes.Buffer, envs []TransportEnvelope) error {
 	binary.BigEndian.PutUint16(tmp[:], uint16(len(envs)))
 	buf.Write(tmp[:])
 	for _, env := range envs {
-		// Fast path: ActorForward with string body.
-		if env.Tag == TagActorForward {
-			if msg, ok := env.Payload.(*ActorForward); ok {
+		// Fast path: actorForward with string body.
+		if env.Tag == tagActorForward {
+			if msg, ok := env.Payload.(*actorForward); ok {
 				if bodyStr, ok := msg.Body.(string); ok {
 					subLen := actorForwardStrSize(msg, bodyStr)
 					n := 1 + 4 + subLen
 					buf.Grow(n)
 					b := buf.AvailableBuffer()[:n]
-					b[0] = TagActorForward
+					b[0] = tagActorForward
 					binary.BigEndian.PutUint32(b[1:], uint32(subLen))
 					encodeActorForwardStr(b, 5, msg, bodyStr)
 					buf.Write(b)
@@ -549,15 +549,15 @@ func encodeBatchPayload(buf *bytes.Buffer, envs []TransportEnvelope) error {
 				}
 			}
 		}
-		// Fast path: ActorForwardReply with string body.
-		if env.Tag == TagActorForwardReply {
-			if msg, ok := env.Payload.(*ActorForwardReply); ok {
+		// Fast path: actorForwardReply with string body.
+		if env.Tag == tagActorForwardReply {
+			if msg, ok := env.Payload.(*actorForwardReply); ok {
 				if bodyStr, ok := msg.Body.(string); ok {
 					subLen := actorForwardReplyStrSize(msg, bodyStr)
 					n := 1 + 4 + subLen
 					buf.Grow(n)
 					b := buf.AvailableBuffer()[:n]
-					b[0] = TagActorForwardReply
+					b[0] = tagActorForwardReply
 					binary.BigEndian.PutUint32(b[1:], uint32(subLen))
 					encodeActorForwardReplyStr(b, 5, msg, bodyStr)
 					buf.Write(b)
@@ -655,8 +655,8 @@ func decodeBatchInto(data []byte, buf []TransportEnvelope) (int, error) {
 // decodePayload reads a payload from data based on the tag.
 func decodePayload(tag byte, data []byte) (interface{}, error) {
 	switch tag {
-	case TagActorForward:
-		msg := actorForwardPool.Get().(*ActorForward)
+	case tagActorForward:
+		msg := actorForwardPool.Get().(*actorForward)
 		off := 0
 		var err error
 		if msg.ActorType, off, err = getStr(data, off); err != nil {
@@ -681,8 +681,8 @@ func decodePayload(tag byte, data []byte) (interface{}, error) {
 		}
 		return msg, nil
 
-	case TagActorForwardReply:
-		msg := actorForwardReplyPool.Get().(*ActorForwardReply)
+	case tagActorForwardReply:
+		msg := actorForwardReplyPool.Get().(*actorForwardReply)
 		off := 0
 		var err error
 		if msg.ReplyID, off, err = getI64(data, off); err != nil {
@@ -699,8 +699,8 @@ func decodePayload(tag byte, data []byte) (interface{}, error) {
 		}
 		return msg, nil
 
-	case TagNotHere:
-		var msg NotHere
+	case tagNotHere:
+		var msg notHere
 		off := 0
 		var err error
 		if msg.ActorType, off, err = getStr(data, off); err != nil {
@@ -717,8 +717,8 @@ func decodePayload(tag byte, data []byte) (interface{}, error) {
 		}
 		return &msg, nil
 
-	case TagHostFrozen:
-		var msg HostFrozen
+	case tagHostFrozen:
+		var msg hostFrozen
 		off := 0
 		var err error
 		if msg.ActorType, off, err = getStr(data, off); err != nil {
@@ -738,19 +738,19 @@ func decodePayload(tag byte, data []byte) (interface{}, error) {
 		}
 		return &msg, nil
 
-	case TagPing:
-		var msg TransportPing
+	case tagPing:
+		var msg transportPing
 		if len(data) >= 8 {
 			msg.SentAt = int64(binary.BigEndian.Uint64(data[:8]))
 		}
 		return &msg, nil
-	case TagPong:
-		var msg TransportPong
+	case tagPong:
+		var msg transportPong
 		if len(data) >= 8 {
 			msg.EchoedAt = int64(binary.BigEndian.Uint64(data[:8]))
 		}
 		return &msg, nil
-	case TagBatch:
+	case tagBatch:
 		return decodeBatchPayload(data)
 	default:
 		return nil, fmt.Errorf("unknown tag %d", tag)

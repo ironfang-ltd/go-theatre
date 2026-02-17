@@ -73,6 +73,16 @@ export default function TopBar() {
             >
               Schedules
             </Link>
+            <Link
+              to="/errors"
+              className="relative rounded-md px-2.5 py-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+              activeProps={{ className: 'relative rounded-md px-2.5 py-1 bg-zinc-800 text-zinc-100' }}
+            >
+              Errors
+              {(data?.metrics?.errors_recorded ?? 0) > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-red-500" />
+              )}
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-3">

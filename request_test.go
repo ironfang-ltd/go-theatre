@@ -6,7 +6,7 @@ import (
 )
 
 func TestRequestManager_CreateAndGet(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	req := rm.Create(ref)
@@ -25,7 +25,7 @@ func TestRequestManager_CreateAndGet(t *testing.T) {
 }
 
 func TestRequestManager_CreateIncrementsID(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	r1 := rm.Create(ref)
@@ -37,7 +37,7 @@ func TestRequestManager_CreateIncrementsID(t *testing.T) {
 }
 
 func TestRequestManager_GetNonExistent(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 
 	got := rm.Get(999)
 	if got != nil {
@@ -46,7 +46,7 @@ func TestRequestManager_GetNonExistent(t *testing.T) {
 }
 
 func TestRequestManager_Remove(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	req := rm.Create(ref)
@@ -61,14 +61,14 @@ func TestRequestManager_Remove(t *testing.T) {
 }
 
 func TestRequestManager_RemoveNonExistent(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 
 	// should not panic
 	rm.Remove(999)
 }
 
 func TestRequestManager_RemoveExpired(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	req := rm.Create(ref)
@@ -96,7 +96,7 @@ func TestRequestManager_RemoveExpired(t *testing.T) {
 }
 
 func TestRequestManager_RemoveExpiredKeepsFresh(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	fresh := rm.Create(ref)
@@ -115,7 +115,7 @@ func TestRequestManager_RemoveExpiredKeepsFresh(t *testing.T) {
 }
 
 func TestRequestManager_PoolDrainsStaleResponses(t *testing.T) {
-	rm := NewRequestManager()
+	rm := newRequestManager()
 	ref := NewRef("test", "1")
 
 	// create a request and stuff a stale response into its channel

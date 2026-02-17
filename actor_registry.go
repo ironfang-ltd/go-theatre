@@ -13,12 +13,12 @@ type actorShard struct {
 	m  map[Ref]*Actor
 }
 
-type ActorRegistry struct {
+type actorRegistry struct {
 	shards [actorShards]actorShard
 }
 
-func NewActorManager() *ActorRegistry {
-	am := &ActorRegistry{}
+func newActorManager() *actorRegistry {
+	am := &actorRegistry{}
 	for i := range am.shards {
 		am.shards[i].m = make(map[Ref]*Actor)
 	}
@@ -39,14 +39,14 @@ func refShard(ref Ref) uint32 {
 	return h & (actorShards - 1)
 }
 
-func (am *ActorRegistry) Register(a *Actor) {
+func (am *actorRegistry) Register(a *Actor) {
 	s := &am.shards[refShard(a.ref)]
 	s.mu.Lock()
 	s.m[a.ref] = a
 	s.mu.Unlock()
 }
 
-func (am *ActorRegistry) Lookup(ref Ref) *Actor {
+func (am *actorRegistry) Lookup(ref Ref) *Actor {
 	s := &am.shards[refShard(ref)]
 	s.mu.RLock()
 	a := s.m[ref]
@@ -54,7 +54,7 @@ func (am *ActorRegistry) Lookup(ref Ref) *Actor {
 	return a
 }
 
-func (am *ActorRegistry) Remove(ref Ref) {
+func (am *actorRegistry) Remove(ref Ref) {
 	s := &am.shards[refShard(ref)]
 	s.mu.Lock()
 	a, ok := s.m[ref]
@@ -67,14 +67,14 @@ func (am *ActorRegistry) Remove(ref Ref) {
 	}
 }
 
-func (am *ActorRegistry) DeregisterOnly(ref Ref) {
+func (am *actorRegistry) DeregisterOnly(ref Ref) {
 	s := &am.shards[refShard(ref)]
 	s.mu.Lock()
 	delete(s.m, ref)
 	s.mu.Unlock()
 }
 
-func (am *ActorRegistry) RemoveIdle(idleTimeout time.Duration) {
+func (am *actorRegistry) RemoveIdle(idleTimeout time.Duration) {
 	for i := range am.shards {
 		s := &am.shards[i]
 		s.mu.Lock()
@@ -89,7 +89,7 @@ func (am *ActorRegistry) RemoveIdle(idleTimeout time.Duration) {
 	}
 }
 
-func (am *ActorRegistry) RemoveAll() {
+func (am *actorRegistry) RemoveAll() {
 	for i := range am.shards {
 		s := &am.shards[i]
 		s.mu.Lock()
@@ -104,7 +104,7 @@ func (am *ActorRegistry) RemoveAll() {
 // ForceDeregisterAll removes all actors from the registry without sending
 // Shutdown. Returns the refs of all removed actors so the caller can
 // release ownership for each.
-func (am *ActorRegistry) ForceDeregisterAll() []Ref {
+func (am *actorRegistry) ForceDeregisterAll() []Ref {
 	var refs []Ref
 	for i := range am.shards {
 		s := &am.shards[i]
@@ -119,7 +119,7 @@ func (am *ActorRegistry) ForceDeregisterAll() []Ref {
 }
 
 // All returns a snapshot of all registered actors.
-func (am *ActorRegistry) All() []*Actor {
+func (am *actorRegistry) All() []*Actor {
 	var actors []*Actor
 	for i := range am.shards {
 		s := &am.shards[i]
@@ -133,7 +133,7 @@ func (am *ActorRegistry) All() []*Actor {
 }
 
 // Count returns the number of registered actors.
-func (am *ActorRegistry) Count() int {
+func (am *actorRegistry) Count() int {
 	count := 0
 	for i := range am.shards {
 		s := &am.shards[i]

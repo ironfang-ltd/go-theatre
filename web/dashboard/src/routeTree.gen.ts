@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as SchedulesIndexRouteImport } from './routes/schedules/index'
 import { Route as HostsIndexRouteImport } from './routes/hosts/index'
+import { Route as ErrorsIndexRouteImport } from './routes/errors/index'
 import { Route as ActorsIndexRouteImport } from './routes/actors/index'
 import { Route as ActorsTypeIdRouteImport } from './routes/actors/$type/$id'
 
@@ -30,6 +31,11 @@ const HostsIndexRoute = HostsIndexRouteImport.update({
   path: '/hosts/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ErrorsIndexRoute = ErrorsIndexRouteImport.update({
+  id: '/errors/',
+  path: '/errors/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ActorsIndexRoute = ActorsIndexRouteImport.update({
   id: '/actors/',
   path: '/actors/',
@@ -44,6 +50,7 @@ const ActorsTypeIdRoute = ActorsTypeIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/actors/': typeof ActorsIndexRoute
+  '/errors/': typeof ErrorsIndexRoute
   '/hosts/': typeof HostsIndexRoute
   '/schedules/': typeof SchedulesIndexRoute
   '/actors/$type/$id': typeof ActorsTypeIdRoute
@@ -51,6 +58,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/actors': typeof ActorsIndexRoute
+  '/errors': typeof ErrorsIndexRoute
   '/hosts': typeof HostsIndexRoute
   '/schedules': typeof SchedulesIndexRoute
   '/actors/$type/$id': typeof ActorsTypeIdRoute
@@ -59,19 +67,33 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/actors/': typeof ActorsIndexRoute
+  '/errors/': typeof ErrorsIndexRoute
   '/hosts/': typeof HostsIndexRoute
   '/schedules/': typeof SchedulesIndexRoute
   '/actors/$type/$id': typeof ActorsTypeIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/actors/' | '/hosts/' | '/schedules/' | '/actors/$type/$id'
+  fullPaths:
+    | '/'
+    | '/actors/'
+    | '/errors/'
+    | '/hosts/'
+    | '/schedules/'
+    | '/actors/$type/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/actors' | '/hosts' | '/schedules' | '/actors/$type/$id'
+  to:
+    | '/'
+    | '/actors'
+    | '/errors'
+    | '/hosts'
+    | '/schedules'
+    | '/actors/$type/$id'
   id:
     | '__root__'
     | '/'
     | '/actors/'
+    | '/errors/'
     | '/hosts/'
     | '/schedules/'
     | '/actors/$type/$id'
@@ -80,6 +102,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ActorsIndexRoute: typeof ActorsIndexRoute
+  ErrorsIndexRoute: typeof ErrorsIndexRoute
   HostsIndexRoute: typeof HostsIndexRoute
   SchedulesIndexRoute: typeof SchedulesIndexRoute
   ActorsTypeIdRoute: typeof ActorsTypeIdRoute
@@ -108,6 +131,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof HostsIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/errors/': {
+      id: '/errors/'
+      path: '/errors'
+      fullPath: '/errors/'
+      preLoaderRoute: typeof ErrorsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/actors/': {
       id: '/actors/'
       path: '/actors'
@@ -128,6 +158,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ActorsIndexRoute: ActorsIndexRoute,
+  ErrorsIndexRoute: ErrorsIndexRoute,
   HostsIndexRoute: HostsIndexRoute,
   SchedulesIndexRoute: SchedulesIndexRoute,
   ActorsTypeIdRoute: ActorsTypeIdRoute,

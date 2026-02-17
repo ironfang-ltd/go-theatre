@@ -11,12 +11,14 @@ import (
 // created in the same second get distinct HostRefs.
 var hostSeq atomic.Int64
 
+// HostRef identifies a host by its IP address, port, and epoch.
 type HostRef struct {
 	IPAddress string
 	Port      int
 	Epoch     int
 }
 
+// NewHostRef creates a host reference with the given IP address, port, and epoch.
 func NewHostRef(ip string, port int, epoch int) HostRef {
 	return HostRef{
 		IPAddress: ip,
@@ -25,6 +27,7 @@ func NewHostRef(ip string, port int, epoch int) HostRef {
 	}
 }
 
+// String returns the host reference in "IP:Port:Epoch" format.
 func (r HostRef) String() string {
 	return fmt.Sprintf("%s:%d:%d", r.IPAddress, r.Port, r.Epoch)
 }

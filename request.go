@@ -7,10 +7,10 @@ import (
 	"time"
 )
 
-var (
-	ErrRequestTimeout = fmt.Errorf("request timeout")
-)
+// ErrRequestTimeout is returned when a Request call exceeds the configured timeout.
+var ErrRequestTimeout = fmt.Errorf("request timeout")
 
+// Request tracks an in-flight request/response pair.
 type Request struct {
 	ID       int64
 	To       Ref
@@ -18,6 +18,7 @@ type Request struct {
 	sentAt   int64 // Unix seconds from coarse clock
 }
 
+// Timeout sends a timeout error response to the request's response channel.
 func (r *Request) Timeout() {
 	r.Response <- &Response{Error: ErrRequestTimeout}
 }
@@ -29,15 +30,15 @@ type requestShard struct {
 	m  map[int64]*Request
 }
 
-type RequestManager struct {
+type requestManager struct {
 	shards  [requestShards]requestShard
 	reqPool sync.Pool
 	resPool *sync.Pool // shared Response pool (set by Host after construction)
 	reqID   int64
 }
 
-func NewRequestManager() *RequestManager {
-	rm := &RequestManager{
+func newRequestManager() *requestManager {
+	rm := &requestManager{
 		reqPool: sync.Pool{
 			New: func() interface{} {
 				return &Request{
@@ -52,11 +53,11 @@ func NewRequestManager() *RequestManager {
 	return rm
 }
 
-func (rm *RequestManager) shard(id int64) *requestShard {
+func (rm *requestManager) shard(id int64) *requestShard {
 	return &rm.shards[id&(requestShards-1)]
 }
 
-func (rm *RequestManager) Create(ref Ref) *Request {
+func (rm *requestManager) Create(ref Ref) *Request {
 
 	reqID := atomic.AddInt64(&rm.reqID, 1)
 
@@ -79,7 +80,7 @@ func (rm *RequestManager) Create(ref Ref) *Request {
 	return r
 }
 
-func (rm *RequestManager) Get(id int64) *Request {
+func (rm *requestManager) Get(id int64) *Request {
 	s := rm.shard(id)
 	s.mu.RLock()
 	r := s.m[id]
@@ -87,7 +88,7 @@ func (rm *RequestManager) Get(id int64) *Request {
 	return r
 }
 
-func (rm *RequestManager) Remove(id int64) {
+func (rm *requestManager) Remove(id int64) {
 	s := rm.shard(id)
 	s.mu.Lock()
 	r, ok := s.m[id]
@@ -100,7 +101,7 @@ func (rm *RequestManager) Remove(id int64) {
 	}
 }
 
-func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
+func (rm *requestManager) RemoveExpired(requestTimeout time.Duration) int {
 	expired := 0
 	cutoff := coarseNow.Load() - int64(requestTimeout.Seconds())
 	for i := range rm.shards {
@@ -122,7 +123,7 @@ func (rm *RequestManager) RemoveExpired(requestTimeout time.Duration) int {
 
 // FailAll sends an error response to all pending requests and removes
 // them from the manager. Used during freeze to unblock waiting callers.
-func (rm *RequestManager) FailAll(err error) {
+func (rm *requestManager) FailAll(err error) {
 	for i := range rm.shards {
 		s := &rm.shards[i]
 		s.mu.Lock()
@@ -138,7 +139,7 @@ func (rm *RequestManager) FailAll(err error) {
 
 // getResponse returns a Response from the shared pool, or allocates
 // a fresh one if the pool is not set (e.g. in standalone tests).
-func (rm *RequestManager) getResponse() *Response {
+func (rm *requestManager) getResponse() *Response {
 	if rm.resPool != nil {
 		res := rm.resPool.Get().(*Response)
 		res.Body = nil

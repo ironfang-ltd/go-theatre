@@ -52,6 +52,7 @@ func (r *HashRing) Lookup(key string) (string, bool) {
 // Set rebuilds the ring with the given members. Deterministic:
 // same member set always produces the same ring regardless of
 // input order.
+// Set replaces the ring's members. The ring is rebuilt immutably and swapped atomically.
 func (r *HashRing) Set(members []string) {
 	sorted := make([]string, len(members))
 	copy(sorted, members)

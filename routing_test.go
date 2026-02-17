@@ -126,7 +126,7 @@ func TestRouting_CrossHostSend(t *testing.T) {
 	}
 
 	// Populate A's placement cache to point to B.
-	hostA.placementCache.Put(ref, PlacementEntry{
+	hostA.placementCache.Put(ref, placementEntry{
 		HostID:  "host-b",
 		Address: tB.Addr(),
 		Epoch:   1,
@@ -167,7 +167,7 @@ func TestRouting_CrossHostRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hostA.placementCache.Put(ref, PlacementEntry{
+	hostA.placementCache.Put(ref, placementEntry{
 		HostID:  "host-b",
 		Address: tB.Addr(),
 		Epoch:   1,
@@ -189,7 +189,7 @@ func TestRouting_NotHere_EvictsCache(t *testing.T) {
 
 	// NO actor on B. Cache points to B anyway (stale).
 	ref := NewRef("echo", "99")
-	hostA.placementCache.Put(ref, PlacementEntry{
+	hostA.placementCache.Put(ref, placementEntry{
 		HostID:  "host-b",
 		Address: tB.Addr(),
 		Epoch:   1,
@@ -198,10 +198,10 @@ func TestRouting_NotHere_EvictsCache(t *testing.T) {
 	// Register echo on A so the descriptor exists (for Send to not error).
 	hostA.RegisterActor("echo", func() Receiver { return &echoReceiver{} })
 
-	// Send from A → forwards to B → B sends NotHere → A evicts cache.
+	// Send from A → forwards to B → B sends notHere → A evicts cache.
 	hostA.Send(ref, "test")
 
-	// Wait for NotHere to arrive and evict the cache.
+	// Wait for notHere to arrive and evict the cache.
 	deadline := time.After(2 * time.Second)
 	for {
 		_, ok := hostA.placementCache.Get(ref)
@@ -210,7 +210,7 @@ func TestRouting_NotHere_EvictsCache(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatal("timeout waiting for cache eviction after NotHere")
+			t.Fatal("timeout waiting for cache eviction after notHere")
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -224,7 +224,7 @@ func TestRouting_EpochMismatch_EvictsCache(t *testing.T) {
 	ref := NewRef("echo", "1")
 
 	// Cache has epoch 5 but liveness shows epoch 1 → mismatch.
-	hostA.placementCache.Put(ref, PlacementEntry{
+	hostA.placementCache.Put(ref, placementEntry{
 		HostID:  "host-b",
 		Address: tB.Addr(),
 		Epoch:   5, // stale epoch
@@ -263,7 +263,7 @@ func TestRouting_HostDead_EvictsCache(t *testing.T) {
 	ref := NewRef("echo", "1")
 
 	// Cache points to "host-c" which is not in the liveness list.
-	hostA.placementCache.Put(ref, PlacementEntry{
+	hostA.placementCache.Put(ref, placementEntry{
 		HostID:  "host-c",
 		Address: "127.0.0.1:9999",
 		Epoch:   1,

@@ -127,6 +127,21 @@ export interface ClusterTypes {
   types: string[]
 }
 
+export interface ErrorEntry {
+  time: string
+  level: 'error' | 'warn'
+  source: string
+  message: string
+  actor?: string
+  detail?: string
+  host_id?: string
+}
+
+export interface ClusterErrors {
+  errors: ErrorEntry[]
+  total: number
+}
+
 // fetchAllClusterSchedules fetches cluster-wide schedules from the server-side aggregation endpoint.
 export async function fetchAllClusterSchedules(): Promise<ClusterSchedules> {
   const res = await fetch('/cluster/all-schedules')
@@ -185,5 +200,12 @@ export async function fetchAllClusterStatus(): Promise<ClusterStatus> {
 export async function fetchClusterHosts(): Promise<ClusterHosts> {
   const res = await fetch('/cluster/hosts')
   if (!res.ok) throw new Error(`GET /cluster/hosts: ${res.status}`)
+  return res.json()
+}
+
+export async function fetchAllClusterErrors(limit: number = 50): Promise<ClusterErrors> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  const res = await fetch(`/cluster/all-errors?${params}`)
+  if (!res.ok) throw new Error(`GET /cluster/all-errors: ${res.status}`)
   return res.json()
 }

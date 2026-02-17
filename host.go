@@ -10,29 +10,39 @@ import (
 )
 
 var (
+	// ErrUnregisteredActorType is returned when a message targets an actor type
+	// that has not been registered with Host.RegisterActor.
 	ErrUnregisteredActorType = fmt.Errorf("unregistered actor type")
-	ErrHostDraining          = fmt.Errorf("host is draining")
-	ErrHostFrozen            = fmt.Errorf("host is frozen")
+	// ErrHostDraining is returned when Send/Request is called while the host is shutting down.
+	ErrHostDraining = fmt.Errorf("host is draining")
+	// ErrHostFrozen is returned when Send/Request is called while the host's lease has expired.
+	ErrHostFrozen = fmt.Errorf("host is frozen")
 )
 
+// Creator is a factory function that returns a new Receiver instance.
+// Registered via Host.RegisterActor and called each time an actor of that type is activated.
 type Creator func() Receiver
 
+// Descriptor binds an actor type name to its Creator factory.
 type Descriptor struct {
 	Name   string
 	Create Creator
 }
 
+// Response holds the result of a Request call.
 type Response struct {
 	Body  interface{}
 	Error error
 }
 
+// Host is the runtime container for actors. It manages actor lifecycles, routes
+// messages, tracks request/response pairs, and runs periodic cleanup.
 type Host struct {
 	hostRef     HostRef
 	config      hostConfig
 	descriptors sync.Map // map[string]*Descriptor
-	actors      *ActorRegistry
-	requests    *RequestManager
+	actors      *actorRegistry
+	requests    *requestManager
 	directory   Directory
 
 	resPool  sync.Pool
@@ -45,9 +55,9 @@ type Host struct {
 	transport      *Transport
 	cluster        *Cluster
 	localHostID    string // cached from cluster.LocalHostID(); set in SetCluster
-	placementCache *PlacementCache
+	placementCache *placementCache
 
-	// Pending remote requests awaiting reply or NotHere.
+	// Pending remote requests awaiting reply or notHere.
 	pendingRemote *pendingRemoteMap
 
 	// Activation gate: deduplicates concurrent activations for the same Ref.
@@ -58,6 +68,7 @@ type Host struct {
 
 	// Observability.
 	metrics     *Metrics
+	errorLog    *ErrorLog
 	adminServer *AdminServer
 
 	// Freeze state. Protected by freezeMu for ctx/cancel pair;
@@ -72,6 +83,8 @@ type Host struct {
 	outboxWg sync.WaitGroup // tracks processOutbox goroutines
 }
 
+// NewHost creates a new host with the given options. Call Start to begin
+// processing messages and Stop to shut down gracefully.
 func NewHost(opts ...Option) *Host {
 
 	cfg := defaultHostConfig()
@@ -87,13 +100,14 @@ func NewHost(opts ...Option) *Host {
 	freezeCtx, freezeCancel := context.WithCancel(context.Background())
 
 	metrics := newMetrics()
+	errorLog := newErrorLog(256)
 
 	h := &Host{
 		hostRef:  hostRef,
 		config:   cfg,
-		requests: NewRequestManager(),
-		directory:    NewDirectory(),
-		actors:       NewActorManager(),
+		requests: newRequestManager(),
+		directory:    newDirectory(),
+		actors:       newActorManager(),
 		resPool: sync.Pool{
 			New: func() interface{} {
 				return &Response{}
@@ -106,6 +120,7 @@ func NewHost(opts ...Option) *Host {
 		freezeCtx: freezeCtx,
 		freezeCancel: freezeCancel,
 		metrics:      metrics,
+		errorLog:     errorLog,
 	}
 
 	metrics.actorCountFn = h.actors.Count
@@ -115,6 +130,8 @@ func NewHost(opts ...Option) *Host {
 	return h
 }
 
+// Start launches the host's message processing goroutines, cleanup loop,
+// admin server (if configured), and cluster integration (if configured).
 func (m *Host) Start() {
 
 	slog.Info("starting", "host", m.hostRef.String())
@@ -177,8 +194,8 @@ func (m *Host) connectPeers() {
 				continue
 			}
 			ping := TransportEnvelope{
-				Tag:     TagPing,
-				Payload: &TransportPing{SentAt: time.Now().UnixMicro()},
+				Tag:     tagPing,
+				Payload: &transportPing{SentAt: time.Now().UnixMicro()},
 			}
 			_ = m.transport.SendTo(h.HostID, h.Address, ping)
 		}
@@ -197,6 +214,8 @@ func (m *Host) connectPeers() {
 	}
 }
 
+// Stop gracefully shuts down the host. It drains in-flight messages, stops all
+// actors, and releases cluster resources. Safe to call multiple times.
 func (m *Host) Stop() {
 	m.stopOnce.Do(func() {
 		slog.Info("stopping", "host", m.hostRef.String())
@@ -232,11 +251,13 @@ func (m *Host) Stop() {
 }
 
 // IsFrozen returns whether the host is currently frozen.
+// IsFrozen returns whether the host is currently frozen due to a lost lease.
 func (m *Host) IsFrozen() bool {
 	return m.frozen.Load()
 }
 
 // Metrics returns the host's operational metrics.
+// Metrics returns the host's operational counters.
 func (m *Host) Metrics() *Metrics {
 	return m.metrics
 }
@@ -329,6 +350,8 @@ func (m *Host) waitForDrain() {
 	}
 }
 
+// RegisterActor registers an actor type with the host. The creator function is
+// called to instantiate a new Receiver each time an actor of this type is activated.
 func (m *Host) RegisterActor(name string, creator Creator) {
 	m.descriptors.Store(name, &Descriptor{
 		Name:   name,
@@ -349,6 +372,8 @@ func (m *Host) getDescriptor(typeName string) *Descriptor {
 	return v.(*Descriptor)
 }
 
+// Send delivers a fire-and-forget message to the actor identified by ref.
+// The actor is created lazily if it does not exist.
 func (m *Host) Send(ref Ref, body interface{}) error {
 
 	if m.draining.Load() {
@@ -420,6 +445,8 @@ func (m *Host) Send(ref Ref, body interface{}) error {
 	return nil
 }
 
+// Request sends a message to the actor identified by ref and blocks until a
+// reply is received or the configured request timeout expires.
 func (m *Host) Request(ref Ref, body interface{}) (interface{}, error) {
 
 	if m.draining.Load() {
@@ -552,6 +579,7 @@ func (m *Host) processInbox() {
 				a = m.standaloneActivate(msg.RecipientRef)
 				if a == nil {
 					slog.Error("failed to create actor", "type", msg.RecipientRef.Type, "id", msg.RecipientRef.ID)
+					m.recordError("host", "failed to create actor", msg.RecipientRef.Type+"/"+msg.RecipientRef.ID)
 					if m.config.deadLetterHandler != nil {
 						m.config.deadLetterHandler(msg)
 					}
@@ -599,7 +627,7 @@ func (m *Host) createLocalActor(ref Ref, reason ActivationReason) *Actor {
 
 	receiver := d.Create()
 
-	a := NewActor(m, ref, receiver, parentCtx, m.config.actorInboxSize)
+	a := newActor(m, ref, receiver, parentCtx, m.config.actorInboxSize)
 	a.noPanicRecovery = !m.config.panicRecovery
 	a.selfDeregister = true
 	a.releaseOnStop = true
@@ -642,6 +670,43 @@ func (m *Host) standaloneActivate(ref Ref) *Actor {
 	a := m.createLocalActor(ref, ActivationNew)
 	gate.actor = a
 	return a
+}
+
+// recordError records a framework error in the error log and increments the metric.
+func (m *Host) recordError(source, message, detail string) {
+	m.errorLog.Record(ErrorEntry{
+		Time:    time.Now(),
+		Level:   "error",
+		Source:  source,
+		Message: message,
+		Detail:  detail,
+	})
+	m.metrics.ErrorsRecorded.Add(1)
+}
+
+// recordWarn records a framework warning in the error log and increments the metric.
+func (m *Host) recordWarn(source, message, detail string) {
+	m.errorLog.Record(ErrorEntry{
+		Time:    time.Now(),
+		Level:   "warn",
+		Source:  source,
+		Message: message,
+		Detail:  detail,
+	})
+	m.metrics.ErrorsRecorded.Add(1)
+}
+
+// recordActorError records an actor-specific error in the error log.
+func (m *Host) recordActorError(ref Ref, message, detail string) {
+	m.errorLog.Record(ErrorEntry{
+		Time:    time.Now(),
+		Level:   "error",
+		Source:  "actor",
+		Message: message,
+		Actor:   ref.Type + "/" + ref.ID,
+		Detail:  detail,
+	})
+	m.metrics.ErrorsRecorded.Add(1)
 }
 
 func (m *Host) cleanup() {

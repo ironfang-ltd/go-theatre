@@ -10,19 +10,28 @@ import (
 	"time"
 )
 
+// ErrStopActor is returned from Receiver.Receive to signal that the actor
+// should stop itself. The host will deregister the actor after it exits.
 var ErrStopActor = fmt.Errorf("stop actor")
 
+// Receiver is the primary extension interface. Implement Receive to define
+// actor behavior. Each call processes one message sequentially.
 type Receiver interface {
 	Receive(ctx *Context) error
 }
 
+// ActorStatus represents the lifecycle state of an actor.
 type ActorStatus int64
 
 const (
+	// ActorStatusActive indicates the actor is running and processing messages.
 	ActorStatusActive ActorStatus = iota
+	// ActorStatusInactive indicates the actor has stopped.
 	ActorStatusInactive
 )
 
+// Actor is a running actor instance. Each actor runs in its own goroutine,
+// processing messages sequentially from its inbox channel.
 type Actor struct {
 	host            *Host
 	ref             Ref
@@ -45,7 +54,7 @@ type Actor struct {
 	actorCancel context.CancelFunc
 }
 
-func NewActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context, inboxSize int) *Actor {
+func newActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context, inboxSize int) *Actor {
 	actorCtx, actorCancel := context.WithCancel(parentCtx)
 	return &Actor{
 		host:        host,
@@ -59,10 +68,13 @@ func NewActor(host *Host, ref Ref, receiver Receiver, parentCtx context.Context,
 	}
 }
 
+// GetStatus returns the actor's current lifecycle status.
 func (a *Actor) GetStatus() ActorStatus {
 	return ActorStatus(atomic.LoadInt64(&a.status))
 }
 
+// Send delivers a message to the actor's inbox. If the actor is inactive
+// or its context has been cancelled, the message is dropped.
 func (a *Actor) Send(msg InboxMessage) {
 
 	if a.GetStatus() == ActorStatusInactive {
@@ -77,6 +89,8 @@ func (a *Actor) Send(msg InboxMessage) {
 	}
 }
 
+// Receive runs the actor's message processing loop. Called as a goroutine
+// by the host; it processes messages sequentially until shutdown or context cancellation.
 func (a *Actor) Receive() {
 
 	selfStopped := false
@@ -152,6 +166,7 @@ func (a *Actor) Receive() {
 					return
 				}
 				slog.Error("actor receive error", "type", a.ref.Type, "id", a.ref.ID, "error", err)
+				a.host.recordActorError(a.ref, "receive error", err.Error())
 				a.replyWithError(msg, err)
 			}
 
@@ -162,6 +177,7 @@ func (a *Actor) Receive() {
 	}
 }
 
+// Shutdown sends a Shutdown message to the actor and blocks until it exits.
 func (a *Actor) Shutdown() {
 	a.Send(InboxMessage{
 		RecipientRef: a.ref,
@@ -171,11 +187,14 @@ func (a *Actor) Shutdown() {
 	<-a.shutdown
 }
 
+// ForceStop cancels the actor's context and closes its inbox, causing
+// immediate exit even if the actor is stuck in a blocking operation.
 func (a *Actor) ForceStop() {
 	a.actorCancel()
 	close(a.inbox)
 }
 
+// GetLastMessageTime returns the time of the last message processed by the actor.
 func (a *Actor) GetLastMessageTime() time.Time {
 	t := time.Unix(atomic.LoadInt64(&a.lastMessage), 0)
 	return t

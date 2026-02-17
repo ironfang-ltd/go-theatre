@@ -223,12 +223,12 @@ func TestRoutingIntegration_NotHereThenReResolve(t *testing.T) {
 	}
 
 	// Ownership DB says host-b (wrong — simulates stale ownership that
-	// was correct before a migration). Actor will NotHere from B.
+	// was correct before a migration). Actor will notHere from B.
 	insertOwnership(t, db, "echo", "3", "host-b", nodeB.cluster.LocalEpoch())
 
-	// Request from A → DB says host-b → forward to B → B sends NotHere
+	// Request from A → DB says host-b → forward to B → B sends notHere
 	// → A evicts cache → A re-resolves from DB → DB still says host-b
-	// → second NotHere → request fails with ErrNoOwner.
+	// → second notHere → request fails with ErrNoOwner.
 	_, err := nodeA.host.Request(ref, "should-fail")
 	if err == nil {
 		t.Fatal("expected error for stale ownership, got nil")

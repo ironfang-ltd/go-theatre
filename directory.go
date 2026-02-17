@@ -2,6 +2,7 @@ package theatre
 
 import "sync"
 
+// Directory provides actor-to-host lookup for distributed placement.
 type Directory interface {
 	Register(ref Ref, hostRef HostRef)
 	Lookup(ref Ref) (HostRef, bool)
@@ -13,7 +14,7 @@ type directory struct {
 	mu     sync.RWMutex
 }
 
-func NewDirectory() Directory {
+func newDirectory() Directory {
 	return &directory{
 		actors: make(map[Ref]HostRef),
 	}

@@ -6,8 +6,10 @@ import (
 	"time"
 )
 
+// DeadLetterHandler is called when a message cannot be delivered to any actor.
 type DeadLetterHandler func(msg InboxMessage)
 
+// Option configures a Host. Passed to NewHost.
 type Option func(*hostConfig)
 
 type hostConfig struct {
@@ -67,66 +69,77 @@ func defaultHostConfig() hostConfig {
 	}
 }
 
+// WithIdleTimeout sets how long an actor can be idle before being removed. Default: 15s.
 func WithIdleTimeout(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.idleTimeout = d
 	}
 }
 
+// WithRequestTimeout sets how long Request calls wait for a reply. Default: 5s.
 func WithRequestTimeout(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.requestTimeout = d
 	}
 }
 
+// WithCleanupInterval sets how often the host checks for idle actors and expired requests. Default: 1s.
 func WithCleanupInterval(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.cleanupInterval = d
 	}
 }
 
+// WithDrainTimeout sets how long Stop waits for in-flight messages to complete. Default: 5s.
 func WithDrainTimeout(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.drainTimeout = d
 	}
 }
 
+// WithPlacementTTL sets how long cached actor placement entries are valid. Default: 10s.
 func WithPlacementTTL(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.placementTTL = d
 	}
 }
 
+// WithDeadLetterHandler sets the callback for undeliverable messages.
 func WithDeadLetterHandler(h DeadLetterHandler) Option {
 	return func(c *hostConfig) {
 		c.deadLetterHandler = h
 	}
 }
 
+// WithFreezeGracePeriod sets how long to wait for actors to exit during a freeze. Default: 2s.
 func WithFreezeGracePeriod(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.freezeGracePeriod = d
 	}
 }
 
+// WithSafetyMargin sets the remaining lease threshold that triggers a freeze. Default: 3s.
 func WithSafetyMargin(d time.Duration) Option {
 	return func(c *hostConfig) {
 		c.safetyMargin = d
 	}
 }
 
+// WithMaxRenewalFailures sets consecutive renewal failures before triggering a freeze. Default: 2.
 func WithMaxRenewalFailures(n int) Option {
 	return func(c *hostConfig) {
 		c.maxRenewalFailures = n
 	}
 }
 
+// WithAdminAddr enables the admin HTTP server on the given address. Empty disables it.
 func WithAdminAddr(addr string) Option {
 	return func(c *hostConfig) {
 		c.adminAddr = addr
 	}
 }
 
+// WithLogLevel sets the minimum log level for the structured JSON logger.
 func WithLogLevel(level slog.Level) Option {
 	return func(c *hostConfig) {
 		c.logLevel = level
