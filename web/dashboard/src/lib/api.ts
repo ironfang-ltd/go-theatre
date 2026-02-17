@@ -106,6 +106,7 @@ export interface ActorDetail {
   owner_host?: string
   owner_addr?: string
   epoch?: number
+  host_id?: string
 }
 
 export interface ScheduleEntry {
@@ -174,8 +175,8 @@ export async function fetchActorDetail(
   id: string,
 ): Promise<ActorDetail> {
   const params = new URLSearchParams({ type, id })
-  const res = await fetch(`/cluster/actor-detail?${params}`)
-  if (!res.ok) throw new Error(`GET /cluster/actor-detail: ${res.status}`)
+  const res = await fetch(`/cluster/all-actor-detail?${params}`)
+  if (!res.ok) throw new Error(`GET /cluster/all-actor-detail: ${res.status}`)
   return res.json()
 }
 

@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { useActorDetail } from '../../../hooks/use-actor-detail'
+import { useClusterErrors } from '../../../hooks/use-cluster-errors'
 import ActorStatusBadge from '../../../components/ActorStatusBadge'
 import StatCard from '../../../components/StatCard'
 import DetailCard, { Row } from '../../../components/DetailCard'
@@ -12,6 +13,13 @@ export const Route = createFileRoute('/actors/$type/$id')({
 function ActorDetailPage() {
   const { type, id } = Route.useParams()
   const { data, isLoading, error } = useActorDetail(type, id)
+  const { data: errorsData } = useClusterErrors()
+
+  // Filter errors for this actor.
+  const actorKey = `${type}/${id}`
+  const actorErrors = (errorsData?.errors ?? []).filter(
+    (e) => e.actor === actorKey,
+  )
 
   if (isLoading) {
     return <p className="text-zinc-500">Loading...</p>
@@ -73,6 +81,11 @@ function ActorDetailPage() {
         {data.receiver_type && (
           <span className="rounded-md bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400 font-mono">
             {data.receiver_type}
+          </span>
+        )}
+        {data.host_id && (
+          <span className="rounded-md bg-zinc-800 px-2 py-0.5 text-xs text-zinc-500 font-mono">
+            {data.host_id}
           </span>
         )}
       </div>
@@ -174,6 +187,9 @@ function ActorDetailPage() {
           {data.receiver_type && (
             <Row label="Receiver" value={data.receiver_type} mono />
           )}
+          {data.host_id && (
+            <Row label="Host" value={data.host_id} mono />
+          )}
         </DetailCard>
 
         {/* Cluster Ownership */}
@@ -191,6 +207,53 @@ function ActorDetailPage() {
           </DetailCard>
         )}
       </div>
+
+      {/* Recent Errors */}
+      {actorErrors.length > 0 && (
+        <div className="space-y-3">
+          <h2 className="text-sm font-medium text-zinc-400">
+            Recent Errors ({actorErrors.length})
+          </h2>
+          <div className="overflow-x-auto rounded-lg border border-zinc-800">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-zinc-800 bg-zinc-900/50">
+                <tr>
+                  <th className="px-4 py-2 font-medium text-zinc-400">Time</th>
+                  <th className="px-4 py-2 font-medium text-zinc-400">Level</th>
+                  <th className="px-4 py-2 font-medium text-zinc-400">Message</th>
+                  <th className="px-4 py-2 font-medium text-zinc-400">Detail</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {actorErrors.map((e, i) => (
+                  <tr key={i} className="bg-zinc-900">
+                    <td className="whitespace-nowrap px-4 py-2 text-zinc-300">
+                      <span title={e.time}>{timeSince(e.time)}</span>
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2">
+                      <span
+                        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${
+                          e.level === 'error'
+                            ? 'bg-red-500/15 text-red-400 border-red-500/25'
+                            : 'bg-amber-500/15 text-amber-400 border-amber-500/25'
+                        }`}
+                      >
+                        {e.level}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 text-zinc-300">{e.message}</td>
+                    <td className="px-4 py-2 text-zinc-400">
+                      <pre className="whitespace-pre-wrap break-all font-mono text-xs">
+                        {e.detail || '-'}
+                      </pre>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"reflect"
 	"runtime"
 	"slices"
@@ -61,6 +62,7 @@ func NewAdminServer(host *Host, addr string) (*AdminServer, error) {
 	mux.HandleFunc("/cluster/all-status", as.handleAllStatus)
 	mux.HandleFunc("/cluster/all-schedules", as.handleAllSchedules)
 	mux.HandleFunc("/cluster/all-actors", as.handleAllActors)
+	mux.HandleFunc("/cluster/all-actor-detail", as.handleAllActorDetail)
 	mux.HandleFunc("/cluster/actor", as.handleClusterActor)
 	mux.HandleFunc("/cluster/local-actor", as.handleLocalActor)
 	mux.HandleFunc("/cluster/errors", as.handleClusterErrors)
@@ -444,6 +446,9 @@ type actorDetailResponse struct {
 	OwnerHost string `json:"owner_host,omitempty"`
 	OwnerAddr string `json:"owner_addr,omitempty"`
 	Epoch     int64  `json:"epoch,omitempty"`
+
+	// Which host this actor lives on (set by all-actor-detail fan-out).
+	HostID string `json:"host_id,omitempty"`
 }
 
 func (as *AdminServer) handleActorDetail(w http.ResponseWriter, r *http.Request) {
@@ -459,49 +464,115 @@ func (as *AdminServer) handleActorDetail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	h := as.host
 	ref := NewRef(actorType, actorID)
+	resp := actorDetailResponse{Type: actorType, ID: actorID}
 
+	if a := as.host.actors.Lookup(ref); a != nil {
+		resp = as.buildActorDetail(a, actorType, actorID)
+	}
+
+	as.addOwnership(&resp, ref)
+	writeJSON(w, resp)
+}
+
+// handleAllActorDetail fans out to all hosts to find the actor detail.
+// Returns the first response where found=true, or a not-found response.
+func (as *AdminServer) handleAllActorDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	actorType := r.URL.Query().Get("type")
+	actorID := r.URL.Query().Get("id")
+	if actorType == "" || actorID == "" {
+		http.Error(w, `missing "type" or "id" query parameter`, http.StatusBadRequest)
+		return
+	}
+
+	h := as.host
+	localID := h.localHostID
+	if localID == "" {
+		localID = h.hostRef.String()
+	}
+
+	// Check local first.
+	ref := NewRef(actorType, actorID)
+	if a := h.actors.Lookup(ref); a != nil {
+		resp := as.buildActorDetail(a, actorType, actorID)
+		resp.HostID = localID
+		// Add cluster ownership.
+		as.addOwnership(&resp, ref)
+		writeJSON(w, resp)
+		return
+	}
+
+	// Fan out to remote hosts.
+	path := fmt.Sprintf("/cluster/actor-detail?type=%s&id=%s",
+		url.QueryEscape(actorType), url.QueryEscape(actorID))
+	remotes := as.fanOutGet(r.Context(), path)
+	for hostID, body := range remotes {
+		var resp actorDetailResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			continue
+		}
+		if resp.Found {
+			resp.HostID = hostID
+			writeJSON(w, resp)
+			return
+		}
+	}
+
+	// Not found anywhere — still return ownership info if available.
 	resp := actorDetailResponse{
 		Type: actorType,
 		ID:   actorID,
 	}
+	as.addOwnership(&resp, ref)
+	writeJSON(w, resp)
+}
 
-	// Local actor info.
-	a := h.actors.Lookup(ref)
-	if a != nil {
-		resp.Found = true
-		if a.GetStatus() == ActorStatusActive {
-			resp.Status = "active"
-		} else {
-			resp.Status = "inactive"
-		}
-
-		// Receiver type name via reflection.
-		rt := reflect.TypeOf(a.receiver)
-		if rt.Kind() == reflect.Ptr {
-			resp.ReceiverType = fmt.Sprintf("*%s", rt.Elem().Name())
-		} else {
-			resp.ReceiverType = rt.Name()
-		}
-
-		createdAt := atomic.LoadInt64(&a.createdAt)
-		if createdAt > 0 {
-			resp.CreatedAt = time.Unix(createdAt, 0).Format(time.RFC3339)
-			resp.UptimeMs = time.Since(time.Unix(createdAt, 0)).Milliseconds()
-		}
-
-		if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
-			resp.LastMessage = lastMsg.Format(time.RFC3339)
-		}
-
-		resp.MessagesTotal = atomic.LoadInt64(&a.messagesTotal)
-		resp.ErrorsTotal = atomic.LoadInt64(&a.errorsTotal)
-		resp.InboxSize = len(a.inbox)
-		resp.InboxCap = cap(a.inbox)
+// buildActorDetail populates an actorDetailResponse from a local Actor.
+func (as *AdminServer) buildActorDetail(a *Actor, actorType, actorID string) actorDetailResponse {
+	resp := actorDetailResponse{
+		Type:  actorType,
+		ID:    actorID,
+		Found: true,
 	}
 
-	// Cluster ownership info.
+	if a.GetStatus() == ActorStatusActive {
+		resp.Status = "active"
+	} else {
+		resp.Status = "inactive"
+	}
+
+	rt := reflect.TypeOf(a.receiver)
+	if rt.Kind() == reflect.Ptr {
+		resp.ReceiverType = fmt.Sprintf("*%s", rt.Elem().Name())
+	} else {
+		resp.ReceiverType = rt.Name()
+	}
+
+	createdAt := atomic.LoadInt64(&a.createdAt)
+	if createdAt > 0 {
+		resp.CreatedAt = time.Unix(createdAt, 0).Format(time.RFC3339)
+		resp.UptimeMs = time.Since(time.Unix(createdAt, 0)).Milliseconds()
+	}
+
+	if lastMsg := a.GetLastMessageTime(); !lastMsg.IsZero() {
+		resp.LastMessage = lastMsg.Format(time.RFC3339)
+	}
+
+	resp.MessagesTotal = atomic.LoadInt64(&a.messagesTotal)
+	resp.ErrorsTotal = atomic.LoadInt64(&a.errorsTotal)
+	resp.InboxSize = len(a.inbox)
+	resp.InboxCap = cap(a.inbox)
+	return resp
+}
+
+// addOwnership populates cluster ownership fields on the response.
+func (as *AdminServer) addOwnership(resp *actorDetailResponse, ref Ref) {
+	h := as.host
 	if h.placementCache != nil {
 		if entry, ok := h.placementCache.Get(ref); ok {
 			resp.OwnerHost = entry.HostID
@@ -516,8 +587,6 @@ func (as *AdminServer) handleActorDetail(w http.ResponseWriter, r *http.Request)
 			resp.Epoch = owner.Epoch
 		}
 	}
-
-	writeJSON(w, resp)
 }
 
 // scheduleEntry is a single schedule in the GET /cluster/schedules response.
